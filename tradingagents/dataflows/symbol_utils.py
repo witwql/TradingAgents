@@ -79,6 +79,29 @@ _YAHOO_SAFE = re.compile(r"^[A-Za-z0-9._\-\^=]+$")
 # match before the ``USD`` substring.
 _CRYPTO_QUOTES = ("USDT", "USDC", "USD")
 
+# China A-share auto-suffix ranges (SSE/SZSE cash equities). Bare six-digit
+# codes are suffixed for the whole pipeline so users can type either form;
+# B-shares and BSE codes have no reliable Yahoo coverage and are left alone.
+_ASHARE_SSE_PREFIXES = ("600", "601", "603", "605", "688", "689")
+_ASHARE_SZSE_PREFIXES = ("000", "001", "002", "003", "300", "301")
+_ASHARE_SUFFIX_MAP = {"SS": ".SS", "SH": ".SS", "SZ": ".SZ"}  # .SH is an alias of .SS
+
+# China in-market exchange-traded funds (ETF/LOF). Bare six-digit codes with
+# these prefixes resolve to Yahoo-style suffixed symbols as well; the akshare
+# vendor routes them to the fund history endpoint instead of stock history.
+_FUND_SSE_PREFIXES = ("51", "56", "58")
+_FUND_SZSE_PREFIXES = ("15",)
+_FUND_PREFIXES = _FUND_SSE_PREFIXES + _FUND_SZSE_PREFIXES
+
+
+def is_fund_symbol(s: str) -> bool:
+    """True when ``s`` (bare or suffixed six-digit A-share code) is an ETF/LOF."""
+    s = s.strip().upper().rstrip("+")
+    body = s.split(".", 1)[0]
+    return len(body) == 6 and body.isdigit() and (
+        body.startswith(_FUND_SSE_PREFIXES) or body.startswith(_FUND_SZSE_PREFIXES)
+    )
+
 
 def crypto_base(raw: str) -> str | None:
     """Return the crypto base (e.g. ``BTC``) for a known USD/USDT/USDC-quoted
@@ -101,6 +124,34 @@ def _normalize_crypto(s: str) -> str | None:
     return f"{base}-USD" if base else None
 
 
+def _normalize_ashare(s: str) -> str | None:
+    """Return the canonical suffixed form for an A-share code, else None.
+
+    ``600519`` -> ``600519.SS``, ``000001`` -> ``000001.SZ``,
+    ``600519.SH`` -> ``600519.SS`` (east-money spelling of the SSE suffix).
+    In-market funds resolve too: ``510300`` -> ``510300.SS``,
+    ``159994`` -> ``159994.SZ``. Already-suffixed ``.SS``/``.SZ`` pass through
+    upper-cased. Bare six-digit codes outside the auto-supported ranges return
+    None unchanged.
+    """
+    body, dot, suffix = s.partition(".")
+    if len(body) == 6 and body.isdigit() and (dot == "" or suffix in _ASHARE_SUFFIX_MAP):
+        if dot:
+            canonical = body + _ASHARE_SUFFIX_MAP[suffix]
+        elif body.startswith(_FUND_PREFIXES):
+            # ETFs/LOFs before the stock ranges: SSE 51*/56*/58*, SZSE 15*.
+            canonical = f"{body}.SS" if body.startswith(_FUND_SSE_PREFIXES) else f"{body}.SZ"
+        elif body.startswith(_ASHARE_SSE_PREFIXES):
+            canonical = f"{body}.SS"
+        elif body.startswith(_ASHARE_SZSE_PREFIXES):
+            canonical = f"{body}.SZ"
+        else:
+            # B-shares / BSE: no auto-suffix — leave for explicit handling.
+            return None
+        return canonical if canonical != s else None
+    return None
+
+
 def normalize_symbol(raw: str) -> str:
     """Map a user/broker symbol to its canonical Yahoo Finance symbol.
 
@@ -109,7 +160,10 @@ def normalize_symbol(raw: str) -> str:
       2. Crypto rule: a known crypto base quoted in USD/USDT/USDC (dashed or
          not) -> ``BASE-USD``.
       3. Forex rule: six letters that are two ISO currency codes -> ``PAIR=X``.
-      4. Otherwise the upper-cased symbol is returned unchanged (plain
+      4. A-share rule: bare or suffixed SSE/SZSE codes -> Yahoo's exchange
+         suffix (``600519``/``600519.SH`` -> ``600519.SS``,
+         ``000001`` -> ``000001.SZ``).
+      5. Otherwise the upper-cased symbol is returned unchanged (plain
          equities, ETFs, Yahoo-native symbols like ``GC=F`` or ``^GSPC``).
 
     A trailing ``+`` (broker CFD marker, e.g. ``XAUUSD+``) is stripped before
@@ -124,12 +178,15 @@ def normalize_symbol(raw: str) -> str:
     s = s.rstrip("+")
 
     crypto = _normalize_crypto(s)
+    ashare = _normalize_ashare(s)
     if s in _ALIASES:
         canonical = _ALIASES[s]
     elif crypto is not None:
         canonical = crypto
     elif len(s) == 6 and s[:3] in _FOREX_CURRENCIES and s[3:] in _FOREX_CURRENCIES:
         canonical = f"{s}=X"
+    elif ashare is not None:
+        canonical = ashare
     else:
         canonical = s
 

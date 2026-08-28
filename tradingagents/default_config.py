@@ -130,11 +130,19 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # The configured value is the exact vendor chain — requests are NOT silently
     # routed to vendors you didn't choose. For ordered fallback, list several,
     # e.g. "yfinance,alpha_vantage". "default" uses all available vendors.
+    # For China A-shares the dashboard preset leads with the unthrottled Sina
+    # hosts and keeps EastMoney/Yahoo as declared fallbacks:
+    #   {"core_stock_apis": "sina,akshare,yfinance",
+    #    "technical_indicators": "sina,akshare,yfinance",
+    #    "fundamental_data": "sina,akshare,yfinance",
+    #    "news_data": "akshare,yfinance"}
+    # (akshare serves A-shares via EastMoney/THS, pip install
+    # "tradingagents[akshare]", no API key)
     "data_vendors": {
-        "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance
-        "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
-        "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance
-        "news_data": "yfinance",             # Options: alpha_vantage, yfinance
+        "core_stock_apis": "yfinance",       # Options: yfinance, alpha_vantage, akshare (A-share codes)
+        "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance, akshare (A-share codes)
+        "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance, akshare (A-share codes)
+        "news_data": "yfinance",             # Options: alpha_vantage, yfinance, akshare (A-share codes)
         "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
         "prediction_markets": "polymarket",  # Options: polymarket (keyless)
     },

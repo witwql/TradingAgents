@@ -121,3 +121,53 @@ class VendorRoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _route_dict(impls):
+    return mock.patch.dict(interface.VENDOR_METHODS,
+                           {"get_stock_data": {**interface.VENDOR_METHODS["get_stock_data"], **impls}},
+                           clear=False)
+
+
+@pytest.mark.unit
+class ThrottleDegradationTests(unittest.TestCase):
+    """All-vendors-throttled chains degrade to an instructive sentinel instead
+    of killing hour-long analyses; real failures still raise loudly."""
+
+    def setUp(self):
+        _reset_config()
+
+    def tearDown(self):
+        _reset_config()
+
+    def test_all_vendors_rate_limited_returns_sentinel(self):
+        from tradingagents.dataflows.errors import VendorRateLimitError
+
+        set_config({"data_vendors": {"core_stock_apis": "akshare,yfinance"}})
+        aks = mock.Mock(side_effect=_raises(VendorRateLimitError("EM dropped x5")))
+        yf = mock.Mock(side_effect=_raises(VendorRateLimitError("429 exhausted")))
+        with _route_dict({"akshare": aks, "yfinance": yf}):
+            result = interface.route_to_vendor(
+                "get_stock_data", "600519.SS", "2026-01-01", "2026-01-10"
+            )
+        self.assertIn("NO_DATA_AVAILABLE", result)
+        self.assertIn("rate-limited", result)
+
+    def test_real_failure_still_raises(self):
+        # A genuine non-throttle error on the only vendor must raise, not degrade.
+        set_config({"data_vendors": {"core_stock_apis": "yfinance"}})
+        broken = mock.Mock(side_effect=_raises(ValueError("auth boom")))
+        with (
+            _route_dict({"yfinance": broken}),
+            self.assertRaises(ValueError),
+        ):
+            interface.route_to_vendor("get_stock_data", "AAPL", "2026-01-01", "2026-01-10")
+
+    def test_no_data_beats_rate_limit_sentinel(self):
+        set_config({"data_vendors": {"core_stock_apis": "yfinance"}})
+        impl = mock.Mock(side_effect=_no_data)
+        with _route_dict({"yfinance": impl}):
+            result = interface.route_to_vendor(
+                "get_stock_data", "FAKE", "2026-01-01", "2026-01-10"
+            )
+        self.assertIn("NO_DATA_AVAILABLE", result)

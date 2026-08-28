@@ -1,5 +1,15 @@
 import logging
 
+from .akshare_news import get_global_news_akshare, get_news_akshare
+from .akshare_stock import (
+    get_balance_sheet_akshare,
+    get_cashflow_akshare,
+    get_fundamentals_akshare,
+    get_income_statement_akshare,
+    get_indicators_akshare,
+    get_insider_transactions_akshare,
+    get_stock_data_akshare,
+)
 from .alpha_vantage import (
     get_balance_sheet as get_alpha_vantage_balance_sheet,
     get_cashflow as get_alpha_vantage_cashflow,
@@ -19,6 +29,14 @@ from .errors import (
 )
 from .fred import get_macro_data as get_fred_macro_data
 from .polymarket import get_prediction_markets as get_polymarket_prediction_markets
+from .sina_stock import (
+    get_balance_sheet_sina,
+    get_cashflow_sina,
+    get_fundamentals_sina,
+    get_income_statement_sina,
+    get_indicators_sina,
+    get_stock_data_sina,
+)
 from .y_finance import (
     get_balance_sheet as get_yfinance_balance_sheet,
     get_cashflow as get_yfinance_cashflow,
@@ -79,6 +97,8 @@ TOOLS_CATEGORIES = {
 
 VENDOR_LIST = [
     "yfinance",
+    "akshare",
+    "sina",
     "fred",
     "polymarket",
     "alpha_vantage",
@@ -97,41 +117,56 @@ VENDOR_METHODS = {
     "get_stock_data": {
         "alpha_vantage": get_alpha_vantage_stock,
         "yfinance": get_YFin_data_online,
+        "akshare": get_stock_data_akshare,   # A-share codes (600519.SS, 000001.SZ)
+        "sina": get_stock_data_sina,       # same codes via Sina hosts
     },
     # technical_indicators
     "get_indicators": {
         "alpha_vantage": get_alpha_vantage_indicator,
         "yfinance": get_stock_stats_indicators_window,
+        "akshare": get_indicators_akshare,
+        "sina": get_indicators_sina,
     },
     # fundamental_data
     "get_fundamentals": {
         "alpha_vantage": get_alpha_vantage_fundamentals,
         "yfinance": get_yfinance_fundamentals,
+        "akshare": get_fundamentals_akshare,
+        "sina": get_fundamentals_sina,
     },
     "get_balance_sheet": {
         "alpha_vantage": get_alpha_vantage_balance_sheet,
         "yfinance": get_yfinance_balance_sheet,
+        "akshare": get_balance_sheet_akshare,
+        "sina": get_balance_sheet_sina,
     },
     "get_cashflow": {
         "alpha_vantage": get_alpha_vantage_cashflow,
         "yfinance": get_yfinance_cashflow,
+        "akshare": get_cashflow_akshare,
+        "sina": get_cashflow_sina,
     },
     "get_income_statement": {
         "alpha_vantage": get_alpha_vantage_income_statement,
         "yfinance": get_yfinance_income_statement,
+        "akshare": get_income_statement_akshare,
+        "sina": get_income_statement_sina,
     },
     # news_data
     "get_news": {
         "alpha_vantage": get_alpha_vantage_news,
         "yfinance": get_news_yfinance,
+        "akshare": get_news_akshare,
     },
     "get_global_news": {
         "yfinance": get_global_news_yfinance,
         "alpha_vantage": get_alpha_vantage_global_news,
+        "akshare": get_global_news_akshare,
     },
     "get_insider_transactions": {
         "alpha_vantage": get_alpha_vantage_insider_transactions,
         "yfinance": get_yfinance_insider_transactions,
+        "akshare": get_insider_transactions_akshare,
     },
     # macro_data
     "get_macro_indicators": {
@@ -194,14 +229,19 @@ def route_to_vendor(method: str, *args, **kwargs):
 
     last_no_data: NoMarketDataError | None = None
     first_error: Exception | None = None
+    rate_limit_only_errors: list[Exception] = []
+    saw_other_failure = False
+    attempts_made = 0
     for vendor in vendor_chain:
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
             return impl_func(*args, **kwargs)
-        except VendorRateLimitError:
+        except VendorRateLimitError as e:
             logger.warning("Vendor %r rate-limited for %s; trying next vendor.", vendor, method)
+            rate_limit_only_errors.append(e)
+            attempts_made += 1
             continue
         except VendorNotConfiguredError as e:
             logger.warning("Vendor %r not configured for %s; trying next vendor.", vendor, method)
@@ -210,14 +250,17 @@ def route_to_vendor(method: str, *args, **kwargs):
             continue
         except NoMarketDataError as e:
             last_no_data = e  # No data here; another configured vendor may have it
+            attempts_made += 1
             continue
         except Exception as e:
             # Don't let one vendor's failure crash the call when another can
             # serve it, but never swallow silently: a broken primary must be
             # visible in the logs (#989), not hidden behind a fallback's verdict.
             logger.warning("Vendor %r failed for %s: %s", vendor, method, e)
+            saw_other_failure = True
             if first_error is None:
                 first_error = e
+            attempts_made += 1
             continue
 
     # If any vendor reported "no data", the symbol is genuinely unavailable.
@@ -244,6 +287,28 @@ def route_to_vendor(method: str, *args, **kwargs):
             f"any configured vendor{reason}. The symbol may be invalid, delisted, "
             f"not covered, or the vendor returned stale data. Do not estimate or "
             f"fabricate values — report that data is unavailable for this symbol."
+        )
+
+    # Every attempt was throttle-shaped (429 / dropped-connection storms) with
+    # nothing else going wrong: aborting an hour-long analysis over transient
+    # infra is worse than telling the agent data is temporarily unavailable.
+    # Real misconfiguration (bad key, code bug) still raises loudly below.
+    if (
+        attempts_made >= 2
+        and not saw_other_failure
+        and rate_limit_only_errors
+        and len(rate_limit_only_errors) == attempts_made
+    ):
+        vendors = ", ".join(vendor_chain)
+        logger.warning(
+            "%s throttled across all vendors [%s]; degrading to sentinel",
+            method, vendors,
+        )
+        return (
+            f"NO_DATA_AVAILABLE: every configured vendor ({vendors}) for "
+            f"'{method}' is currently rate-limited or dropping connections. "
+            "The endpoints should recover shortly — state that market data "
+            "is temporarily unavailable rather than estimating values."
         )
 
     # No vendor returned data and none reported clean "no data" — surface the

@@ -10,12 +10,15 @@ claim. Deterministic, no LLM involved.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 
 import pandas as pd
 from stockstats import wrap
 
 from tradingagents.dataflows.stockstats_utils import load_ohlcv
+
+logger = logging.getLogger(__name__)
 
 # A fixed, common indicator set so the snapshot is the same shape every run.
 DEFAULT_SNAPSHOT_INDICATORS: tuple[str, ...] = (
@@ -26,22 +29,29 @@ DEFAULT_SNAPSHOT_INDICATORS: tuple[str, ...] = (
 
 
 def _verified_rows(symbol: str, curr_date: str) -> pd.DataFrame:
-    """OHLCV on or before curr_date, date-sorted. Raises if nothing usable.
+    """OHLCV on or before curr_date, date-sorted.
 
-    ``load_ohlcv`` already normalizes the Date column and filters out
-    look-ahead rows, but we re-apply the cutoff defensively — this is a
-    verification path, so it must not trust its input to be pre-filtered.
+    Returns None when every configured OHLCV source is unavailable
+    (unknown symbol or transient throttling) so callers degrade to an
+    instructive sentinel instead of crashing the graph.
     """
-    data = load_ohlcv(symbol, curr_date)
+    try:
+        data = load_ohlcv(symbol, curr_date)
+    except Exception as exc:
+        # NoMarketDataError / throttling / transport failures all mean "no
+        # verifiable source right now": degrade to a sentinel rather than
+        # crash the analysis; the warning keeps real breakage visible.
+        logger.warning("verified snapshot has no OHLCV for %s: %s", symbol, exc)
+        return None
     if data is None or data.empty:
-        raise ValueError(f"No OHLCV data available for {symbol}.")
+        return None
 
     df = data.copy()
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.dropna(subset=["Date"])
     df = df[df["Date"] <= pd.to_datetime(curr_date)].sort_values("Date")
     if df.empty:
-        raise ValueError(f"No OHLCV rows on or before {curr_date} for {symbol}.")
+        return None
     return df
 
 
@@ -70,6 +80,14 @@ def build_verified_market_snapshot(
     # Volume); stockstats `wrap()` lowercases columns and adds indicator
     # columns, so read raw prices from `df` and indicators from `stock_df`.
     df = _verified_rows(symbol, curr_date)
+    if df is None:
+        return (
+            f"NO_DATA_AVAILABLE: no OHLCV data could be retrieved for '{symbol}' "
+            f"on or before {curr_date} from any configured source (sources may be "
+            "temporarily rate-limited). Do not estimate prices or indicator "
+            "values — state that verified data is unavailable and avoid exact "
+            "numeric claims in your report."
+        )
     stock_df = wrap(df.copy())
 
     selected = tuple(indicators or DEFAULT_SNAPSHOT_INDICATORS)

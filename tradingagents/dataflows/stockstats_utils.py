@@ -9,6 +9,10 @@ from stockstats import wrap
 from yfinance.exceptions import YFRateLimitError
 
 from .config import get_config
+from .errors import (
+    NoMarketDataError as _NoMarketDataErrorBase,  # noqa: F401
+    VendorRateLimitError,
+)
 from .symbol_utils import NoMarketDataError, normalize_symbol
 from .utils import safe_ticker_component
 
@@ -31,8 +35,12 @@ def yf_retry(func, max_retries=3, base_delay=2.0):
 
     yfinance raises YFRateLimitError on HTTP 429 responses but does not
     retry them internally. This wrapper adds retry logic specifically
-    for rate limits. Other exceptions propagate immediately.
+    for rate limits. Other exceptions propagate immediately. Exhausted
+    limits surface as the routing layer's typed ``VendorRateLimitError``
+    so multi-vendor chains skip to the next source instead of aborting.
     """
+    from .errors import VendorRateLimitError
+
     for attempt in range(max_retries + 1):
         try:
             return func()
@@ -42,7 +50,10 @@ def yf_retry(func, max_retries=3, base_delay=2.0):
                 logger.warning(f"Yahoo Finance rate limited, retrying in {delay:.0f}s (attempt {attempt + 1}/{max_retries})")
                 time.sleep(delay)
             else:
-                raise
+                raise VendorRateLimitError(
+                    "Yahoo Finance 429 rate limit exhausted after "
+                    f"{max_retries} retries"
+                ) from None
 
 
 def _ensure_date_column(data: pd.DataFrame) -> pd.DataFrame:
@@ -145,79 +156,140 @@ def _needs_same_day_refresh(data_file, curr_date_dt, today_date) -> bool:
     return time.time() - os.path.getmtime(data_file) > OHLCV_CACHE_TTL_SECONDS
 
 
+def _resolved_ohlcv_chain() -> list[str]:
+    """Configured OHLCV source chain for indicator calc & verified snapshots.
+
+    Mirrors router precedence: tool-level override, then the technical
+    indicators category, then core stock APIs. Multi-vendor chains are
+    honored in declared order (e.g. ``akshare,yfinance``), keeping the
+    dashboard preset resilient when the primary Chinese endpoint throttles.
+    """
+    config = get_config()
+    tool_vendors = config.get("tool_vendors") or {}
+    data_vendors = config.get("data_vendors") or {}
+    chain = (
+        tool_vendors.get("get_stock_data")
+        or data_vendors.get("technical_indicators")
+        or data_vendors.get("core_stock_apis")
+        or "yfinance"
+    )
+    return [v.strip().lower() for v in str(chain).split(",") if v.strip()]
+
+
+def _fetch_ohlcv_source(source: str, symbol: str, canonical: str,
+                        start_str: str, end_str: str) -> pd.DataFrame | None:
+    """One OHLCV source probe. Returns rows or None when unusable."""
+    if source == "akshare":
+        from tradingagents.dataflows.akshare_stock import (
+            fetch_daily_ohlcv_akshare as _fetch_aks,
+        )
+
+        # The adapter owns its own 5y cache + staleness + look-ahead filtering.
+        return _fetch_aks(symbol, canonical, end_str)
+
+    if source == "sina":
+        from tradingagents.dataflows.sina_stock import (
+            fetch_daily_ohlcv_sina as _fetch_sin,
+        )
+
+        return _fetch_sin(symbol, canonical, end_str)
+
+    if source == "yfinance":
+        canonical_safe = safe_ticker_component(canonical)
+        config = get_config()
+        os.makedirs(config["data_cache_dir"], exist_ok=True)
+        data_file = os.path.join(
+            config["data_cache_dir"],
+            f"{canonical_safe}-YFin-data-{start_str}-{end_str}.csv",
+        )
+        data = None
+        if os.path.exists(data_file):
+            cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
+            today_date = pd.Timestamp.today()
+            curr_dt = pd.to_datetime(end_str)
+            if (
+                not cached.empty
+                and "Close" in cached.columns
+                and not _needs_same_day_refresh(data_file, curr_dt, today_date)
+            ):
+                data = cached
+
+        if data is None:
+            downloaded = yf_retry(lambda: yf.download(
+                canonical,
+                start=start_str,
+                end=end_str,
+                multi_level_index=False,
+                progress=False,
+                auto_adjust=True,
+            ))
+            downloaded = _ensure_date_column(downloaded.reset_index())
+            # Only persist real data — an empty/columnless frame is never
+            # written to disk (poisoned-cache guard) and reports as no rows.
+            if (
+                not isinstance(downloaded, pd.DataFrame)
+                or downloaded.empty
+                or "Close" not in downloaded.columns
+            ):
+                raise NoMarketDataError(symbol, canonical, "yfinance returned no rows")
+            downloaded.to_csv(data_file, index=False, encoding="utf-8")
+            data = downloaded
+
+        if not isinstance(data, pd.DataFrame) or data.empty or "Close" not in data.columns:
+            return None
+        data = _clean_dataframe(data)
+        return data.sort_values("Date").reset_index(drop=True)
+
+    logger.warning("Unknown OHLCV source %r skipped", source)
+    return None
+
+
 def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     """Fetch OHLCV data with caching, filtered to prevent look-ahead bias.
 
-    Downloads 5 years of data up to today and caches per symbol. On
-    subsequent calls the cache is reused. Rows after curr_date are
-    filtered out so backtests never see future prices.
+    Sources follow the configured vendor chain (default ``yfinance``): each
+    source gets one attempt, a clean miss/unavailable result moves to the
+    next, and the last error surfaces if every source is exhausted. Rows
+    after curr_date are always filtered so backtests never see future prices.
     """
-    # Resolve broker/forex symbols (XAUUSD+ -> GC=F) to Yahoo's convention,
-    # then reject values that would escape the cache directory when
-    # interpolated into the cache filename (e.g. ``../../tmp/x``).
     canonical = normalize_symbol(symbol)
-    safe_symbol = safe_ticker_component(canonical)
 
-    config = get_config()
-    curr_date_dt = pd.to_datetime(curr_date)
-
-    # Cache uses a fixed window (5y to today) so one file per symbol.
+    chain = _resolved_ohlcv_chain()
     today_date = pd.Timestamp.today()
-    start_date = today_date - pd.DateOffset(years=5)
-    start_str = start_date.strftime("%Y-%m-%d")
-    # yfinance ``end`` is EXCLUSIVE; request tomorrow so today's row is included
-    # when curr_date is the current day (#986). Look-ahead is still prevented by
-    # the curr_date filter below.
-    end_str = (today_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    start_str = (today_date - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
+    end_inclusive = (today_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
-    os.makedirs(config["data_cache_dir"], exist_ok=True)
-    data_file = os.path.join(
-        config["data_cache_dir"],
-        f"{safe_symbol}-YFin-data-{start_str}-{end_str}.csv",
-    )
-
-    # A cached file may be empty if a prior fetch failed (unknown symbol,
-    # transient rate limit). Treat an empty/columnless cache as a miss and
-    # re-fetch rather than serving the poisoned file forever.
     data = None
-    if os.path.exists(data_file):
-        cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
-        # Serve the cache only when it is usable and not a stale snapshot of the
-        # day being requested (#1150); otherwise fall through and refetch.
-        if (
-            not cached.empty
-            and "Close" in cached.columns
-            and not _needs_same_day_refresh(data_file, curr_date_dt, today_date)
-        ):
-            data = cached
+    last_error: Exception | None = None
+    for source in chain:
+        try:
+            candidate = _fetch_ohlcv_source(
+                source, symbol, canonical, start_str, end_inclusive
+            )
+        except (NoMarketDataError, VendorRateLimitError) as exc:
+            last_error = exc
+            logger.warning("OHLCV source %s unusable for %s: %s", source, symbol, exc)
+            continue
+        except Exception as exc:
+            last_error = exc
+            logger.warning("OHLCV source %s failed for %s: %s", source, symbol, exc)
+            continue
+        if candidate is not None and not candidate.empty:
+            data = candidate
+            break
+        last_error = last_error or NoMarketDataError(
+            symbol, canonical, f"{source} returned no rows"
+        )
 
     if data is None:
-        downloaded = yf_retry(lambda: yf.download(
-            canonical,
-            start=start_str,
-            end=end_str,
-            multi_level_index=False,
-            progress=False,
-            auto_adjust=True,
-        ))
-        downloaded = _ensure_date_column(downloaded.reset_index())
-        # Only cache real data — never persist an empty frame.
-        if downloaded.empty or "Close" not in downloaded.columns:
-            raise NoMarketDataError(
-                symbol, canonical, "Yahoo Finance returned no rows"
-            )
-        downloaded.to_csv(data_file, index=False, encoding="utf-8")
-        data = downloaded
+        raise last_error or NoMarketDataError(symbol, canonical, "no OHLCV source")
 
-    data = _clean_dataframe(data)
+    curr_date_dt = pd.to_datetime(curr_date)
 
-    # Filter to curr_date to prevent look-ahead bias in backtesting
+    # Look-ahead protection shared by every source: drop rows past the
+    # analysis date, then reject year-old frames before they feed indicators.
     data = data[data["Date"] <= curr_date_dt]
-
-    # Reject a stale frame (latest row far older than curr_date) rather than
-    # feeding year-old prices into indicators (#1021).
     _assert_ohlcv_not_stale(data, curr_date, symbol, canonical)
-
     return data
 
 

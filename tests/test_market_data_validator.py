@@ -45,15 +45,15 @@ class TestVerifiedSnapshot:
         assert "Latest trading row used: 2026-05-15" in snap
         assert "Recent verified closes" in snap
 
-    def test_raises_when_no_rows_on_or_before_date(self, monkeypatch):
+    def test_sentinel_when_no_rows_on_or_before_date(self, monkeypatch):
         monkeypatch.setattr(validator, "load_ohlcv", lambda s, d: _sample_ohlcv())
-        with pytest.raises(ValueError):
-            validator.build_verified_market_snapshot("COF", "2020-01-01")
+        snap = validator.build_verified_market_snapshot("COF", "2020-01-01")
+        assert "NO_DATA_AVAILABLE" in snap
 
-    def test_raises_on_empty_data(self, monkeypatch):
+    def test_sentinel_on_empty_data(self, monkeypatch):
         monkeypatch.setattr(validator, "load_ohlcv", lambda s, d: pd.DataFrame())
-        with pytest.raises(ValueError):
-            validator.build_verified_market_snapshot("COF", "2026-05-13")
+        snap = validator.build_verified_market_snapshot("COF", "2026-05-13")
+        assert "NO_DATA_AVAILABLE" in snap
 
     def test_look_back_window_capped_at_30(self, monkeypatch):
         monkeypatch.setattr(validator, "load_ohlcv", lambda s, d: _sample_ohlcv())
@@ -74,3 +74,17 @@ class TestTool:
             {"symbol": "COF", "curr_date": "2026-05-20"}
         )
         assert "Verified market data snapshot for COF" in out
+
+
+@pytest.mark.unit
+def test_snapshot_degrades_to_sentinel_when_no_source(monkeypatch):
+    from tradingagents.dataflows import market_data_validator as mdv
+
+    def raise_throttle(*a, **k):
+        from tradingagents.dataflows.errors import NoMarketDataError
+        raise NoMarketDataError("600519.SS", "600519.SS", "throttled")
+
+    monkeypatch.setattr(mdv, "load_ohlcv", raise_throttle)
+    out = mdv.build_verified_market_snapshot("600519.SS", "2026-08-27")
+    assert "NO_DATA_AVAILABLE" in out
+    assert "temporarily rate-limited" in out
