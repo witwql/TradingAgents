@@ -1,9 +1,39 @@
+import contextvars
 from copy import deepcopy
 
 import tradingagents.default_config as default_config
 
 # Use default config but allow it to be overridden
 _config: dict | None = None
+
+# Per-run scope: set_config mutates process-global state, which is unsafe the
+# moment anything else (screener thread, spot cache, a future second worker)
+# reads config concurrently. Scoped callers get an isolated merged view for
+# the duration of the context; everything else keeps seeing the global.
+_scope: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "tradingagents_config_scope", default=None
+)
+
+
+class config_scope:
+    """with config_scope(cfg): ... — vendor calls inside see exactly ``cfg``.
+
+    ``cfg`` must be a COMPLETE configuration (callers pass the same dict they
+    used to hand to set_config). Nested scopes replace the outer one; on exit
+    the previous scope (or global) is restored.
+    """
+
+    def __init__(self, config: dict):
+        self._config = deepcopy(config)
+        self._token = None
+
+    def __enter__(self):
+        self._token = _scope.set(self._config)
+        return self
+
+    def __exit__(self, *exc):
+        _scope.reset(self._token)
+        return False
 
 
 def initialize_config():
@@ -31,7 +61,10 @@ def set_config(config: dict):
 
 
 def get_config() -> dict:
-    """Get the current configuration."""
+    """Get the current configuration (scoped view wins over global)."""
+    scoped = _scope.get()
+    if scoped is not None:
+        return deepcopy(scoped)
     if _config is None:
         initialize_config()
     return deepcopy(_config)

@@ -94,6 +94,37 @@ _FUND_SZSE_PREFIXES = ("15",)
 _FUND_PREFIXES = _FUND_SSE_PREFIXES + _FUND_SZSE_PREFIXES
 
 
+def ashare_exchange(code_or_symbol: str) -> str | None:
+    """'600519'/'600519.SS' -> 'SH'; '000001'/'159994.SZ' -> 'SZ'; else None.
+
+    Single source of truth for exchange resolution: bare six-digit codes use
+    the auto-suffix ranges (stocks + in-market funds); explicitly suffixed
+    forms map .SS/.SH -> SH and .SZ -> SZ.
+    """
+    s = str(code_or_symbol).strip().upper().rstrip("+")
+    body, dot, suffix = s.partition(".")
+    if not (len(body) == 6 and body.isdigit()):
+        return None
+    if dot:
+        return {"SS": "SH", "SH": "SH", "SZ": "SZ"}.get(suffix)
+    if body.startswith(_FUND_SSE_PREFIXES) or body.startswith(_ASHARE_SSE_PREFIXES):
+        return "SH"
+    if body.startswith(_FUND_SZSE_PREFIXES) or body.startswith(_ASHARE_SZSE_PREFIXES):
+        return "SZ"
+    return None
+
+
+# 沪深主板（普通账户全可交易）：筛选器等按板块限定股票池时的单一来源。
+# 注意与上方自动后缀范围的语义差异：300/301（创业板）、688/689（科创板）
+# 属于合法 Yahoo 后缀但不在主板之列。
+ASHARE_MAIN_BOARD_PREFIXES = ("600", "601", "603", "605", "000", "001", "002", "003")
+
+
+def is_main_board_ashare(code: str) -> bool:
+    body = str(code).strip().upper().rstrip("+").split(".")[0]
+    return len(body) == 6 and body.isdigit() and body.startswith(ASHARE_MAIN_BOARD_PREFIXES)
+
+
 def is_fund_symbol(s: str) -> bool:
     """True when ``s`` (bare or suffixed six-digit A-share code) is an ETF/LOF."""
     s = s.strip().upper().rstrip("+")

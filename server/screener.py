@@ -31,10 +31,10 @@ import numpy as np
 import pandas as pd
 
 from tradingagents.dataflows.akshare_lock import AKSHARE_LOCK
+from tradingagents.dataflows.symbol_utils import is_main_board_ashare
 
 logger = logging.getLogger(__name__)
 
-MAIN_BOARD_PREFIXES = ("600", "601", "603", "605", "000", "001", "002", "003")
 MIN_PRICE = 2.0
 MIN_TURNOVER = 2e8          # 成交额 2 亿
 MAX_CANDIDATES = 120        # 流动性排名后的入池深度
@@ -64,7 +64,7 @@ def fetch_universe() -> list[dict]:
         name = str(r["名称"])
         exchange = raw_code[:2]
         code = raw_code[2:]
-        if exchange not in ("sh", "sz") or not code.startswith(MAIN_BOARD_PREFIXES):
+        if exchange not in ("sh", "sz") or not is_main_board_ashare(code):
             continue
         if "ST" in name.upper() or "退" in name:
             continue
@@ -273,22 +273,13 @@ def run_screening(db, curr_date: str | None = None) -> tuple[str, bool]:
     A running run (started <30min ago) is reused instead of spawning a
     duplicate, so double-clicks / re-entry are harmless.
     """
-    running = db.fetchone(
-        "SELECT id, created_at FROM screen_runs WHERE status='running'"
-        " ORDER BY created_at DESC LIMIT 1"
-    )
-    if running and time.time() - running["created_at"] < 1800:
-        return running["id"], True
-
     run_id = uuid.uuid4().hex[:10]
-    db.execute(
-        "INSERT INTO screen_runs (id, created_at, status, trade_date, stage)"
-        " VALUES (?,?,?,?,?)",
-        (run_id, time.time(), "running",
-         curr_date or datetime.now().strftime("%Y-%m-%d"), "universe"),
+    run_id, already = db.begin_screen_run(
+        run_id, curr_date or datetime.now().strftime("%Y-%m-%d")
     )
-    threading.Thread(target=_run_blocking, args=(db, run_id, curr_date), daemon=True).start()
-    return run_id, False
+    if not already:
+        threading.Thread(target=_run_blocking, args=(db, run_id, curr_date), daemon=True).start()
+    return run_id, already
 
 
 def _run_blocking(db, run_id: str, curr_date: str | None):

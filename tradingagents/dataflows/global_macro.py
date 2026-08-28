@@ -219,8 +219,10 @@ def get_money_flow(
     signals: latest day, 1d/5d/20d aggregates, consecutive-flow streaks, and a
     price-vs-flow divergence flag (价涨资金流出 = distribution risk)."""
     code = str(symbol).strip().upper().rstrip("+")
+    from .symbol_utils import ashare_exchange
+
     bare = code.split(".")[0]
-    market = "sh" if bare.startswith(("6",)) else "sz"
+    market = (ashare_exchange(bare) or "SZ").lower()
 
     raw = _quiet(ak.stock_individual_fund_flow, stock=bare, market=market)
     if raw is None or raw.empty:
@@ -313,9 +315,13 @@ def _factor_returns(symbol: str, curr_date: str, lookback_days: int) -> dict[str
 
     # 主力资金净占比（pct-point 日变化）——EM 限流时优雅跳过
     try:
+        from .symbol_utils import ashare_exchange
+
         bare = to_bare(symbol)
-        raw = _quiet(ak.stock_individual_fund_flow, stock=bare,
-                     market="sh" if bare.startswith("6") else "sz")
+        raw = _quiet(
+            ak.stock_individual_fund_flow, stock=bare,
+            market=(ashare_exchange(bare) or "SZ").lower(),
+        )
         raw["_d"] = pd.to_datetime(raw["日期"], errors="coerce")
         raw = raw[raw["_d"].notna()]
         s = pd.to_numeric(raw["主力净流入-净占比"], errors="coerce").diff()

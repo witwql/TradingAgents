@@ -11,7 +11,7 @@ import logging
 import traceback
 from pathlib import Path
 
-from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.config import config_scope
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -132,8 +132,6 @@ class AnalysisRunner:
         Returns a small result dict (rating/summary/report_dir) the queue can
         persist on success.
         """
-        ticker = task["ticker"]
-
         def progress(event: dict):
             node = event.get("node", "")
             stage = NODE_TO_STAGE.get(node)
@@ -151,10 +149,15 @@ class AnalysisRunner:
             payload = {**payload, "stage": NODE_TO_STAGE.get(payload.get("node") or "")}
             emit(kind, payload)
 
-        agent_handler = AgentStreamHandler(stream_emit)
-
         cfg = self._build_config(task)
-        set_config(cfg)
+        # Scoped, not global: vendor calls inside this run see exactly cfg,
+        # while the screener/spot threads keep their own view of the world.
+        agent_handler = AgentStreamHandler(stream_emit)
+        with config_scope(cfg):
+            return self._run_analysis(task, cfg, progress, agent_handler)
+
+    def _run_analysis(self, task, cfg, progress, agent_handler):
+        ticker = task["ticker"]
         graph = TradingAgentsGraph(
             selected_analysts=tuple(
                 a for a in task.get("analysts", ALL_ANALYST_KEYS) if a in ALL_ANALYST_KEYS

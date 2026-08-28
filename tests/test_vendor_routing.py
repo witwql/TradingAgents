@@ -171,3 +171,43 @@ class ThrottleDegradationTests(unittest.TestCase):
                 "get_stock_data", "FAKE", "2026-01-01", "2026-01-10"
             )
         self.assertIn("NO_DATA_AVAILABLE", result)
+
+
+@pytest.mark.unit
+class ConfigScopeTests(unittest.TestCase):
+    """config_scope isolates per-run config without mutating the global."""
+
+    def setUp(self):
+        _reset_config()
+
+    def tearDown(self):
+        _reset_config()
+
+    def test_scope_overrides_and_restores(self):
+        from tradingagents.dataflows.config import config_scope, get_config
+
+        assert get_config()["data_vendors"]["core_stock_apis"] == "yfinance"
+        with config_scope({**get_config(), "data_vendors": {"core_stock_apis": "sina"}}):
+            assert get_config()["data_vendors"]["core_stock_apis"] == "sina"
+        assert get_config()["data_vendors"]["core_stock_apis"] == "yfinance"
+
+    def test_routed_calls_honor_scope(self):
+        set_config({"data_vendors": {"core_stock_apis": "yfinance"}})
+        impls = {
+            "sina": _returns("SINA_DATA"),
+            "yfinance": _returns("YF_DATA"),
+        }
+        from tradingagents.dataflows.config import config_scope
+
+        from tradingagents.dataflows.config import get_config as _gc
+
+        scoped = {**_gc(), "data_vendors": {"core_stock_apis": "sina"}}
+        with (
+            config_scope(scoped),
+            _route_dict(impls),
+        ):
+            result = interface.route_to_vendor(
+                "get_stock_data", "600519.SS", "2026-01-01", "2026-01-10"
+            )
+        assert result == "SINA_DATA"
+        assert _gc()["data_vendors"]["core_stock_apis"] == "yfinance"  # global untouched

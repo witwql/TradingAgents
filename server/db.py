@@ -203,6 +203,29 @@ class Database:
         refreshed = self.get_task(task["id"])
         return refreshed if refreshed and refreshed["status"] == "running" else None
 
+    def begin_screen_run(self, run_id: str, trade_date: str, reuse_window: float = 1800) -> tuple[str, bool]:
+        """Atomically create a screening run or reuse an in-flight one.
+
+        The existence check and INSERT happen under the connection lock, so
+        two simultaneous POSTs cannot both spawn workers.
+        Returns (run_id, already_running).
+        """
+        with self._lock:
+            running = self._conn.execute(
+                "SELECT id FROM screen_runs WHERE status='running' AND created_at > ?"
+                " ORDER BY created_at DESC LIMIT 1",
+                (time.time() - reuse_window,),
+            ).fetchone()
+            if running:
+                return running["id"], True
+            self._conn.execute(
+                "INSERT INTO screen_runs (id, created_at, status, trade_date, stage)"
+                " VALUES (?,?,?,?,?)",
+                (run_id, time.time(), "running", trade_date, "universe"),
+            )
+            self._conn.commit()
+            return run_id, False
+
     def prune_events(self, keep_tasks: int = 50) -> int:
         """Delete task_events of tasks beyond the most recent ``keep_tasks``.
 

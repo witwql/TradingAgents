@@ -43,7 +43,7 @@ from .stockstats_utils import (
     _clean_dataframe,
     _needs_same_day_refresh,
 )
-from .symbol_utils import is_fund_symbol, normalize_symbol
+from .symbol_utils import ashare_exchange, is_fund_symbol, normalize_symbol
 from .utils import safe_ticker_component
 from .y_finance import INDICATOR_DESCRIPTIONS
 
@@ -102,13 +102,8 @@ def to_sina_symbol(symbol: str) -> str:
     if not isinstance(symbol, str):
         raise NoMarketDataError(str(symbol), detail="symbol must be a string")
     code = to_acode(symbol)
-    if is_fund_symbol(code):
-        exchange = "sh" if code.startswith(("51", "56", "58")) else "sz"
-    elif code.startswith(("600", "601", "603", "605", "688", "689")):
-        exchange = "sh"
-    else:
-        exchange = "sz"
-    return f"{exchange}{code}"
+    exchange = ashare_exchange(code) or ("SH" if code.startswith("6") else "SZ")
+    return exchange.lower() + code
 
 
 def to_acode(symbol: str) -> str:
@@ -179,8 +174,7 @@ def fetch_daily_ohlcv_sina(
 
 def _sina_daily_fn(scode: str):
     """Dispatch between fund and stock daily-history endpoints."""
-    bare = scode[2:]
-    if is_fund_symbol(bare):
+    if is_fund_symbol(scode[2:]):
         return lambda *, symbol, adjust: ak.fund_etf_hist_sina(symbol=symbol)
     return lambda *, symbol, adjust: ak.stock_zh_a_daily(symbol=symbol, adjust=adjust)
 

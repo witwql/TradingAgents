@@ -48,7 +48,7 @@ from .stockstats_utils import (
     _clean_dataframe,
     _needs_same_day_refresh,
 )
-from .symbol_utils import is_fund_symbol, normalize_symbol
+from .symbol_utils import ashare_exchange, is_fund_symbol, normalize_symbol
 from .utils import safe_ticker_component
 from .y_finance import INDICATOR_DESCRIPTIONS
 
@@ -66,11 +66,6 @@ def _require_ak():
             "akshare package is not installed. Install the optional extra: "
             'pip install "tradingagents[akshare]"'
         )
-
-
-_SSE_PREFIXES = ("600", "601", "603", "605", "688", "689")
-_SZSE_PREFIXES = ("000", "001", "002", "003", "300", "301")
-_FUND_PREFIXES = ("51", "56", "58", "15")  # in-market ETF/LOF codes
 
 
 def _no_market(symbol: str, detail: str) -> NoMarketDataError:
@@ -103,8 +98,7 @@ def to_acode(symbol: str) -> str:
             "or 000001.SZ); the akshare vendor only covers SSE/SZSE equities",
         )
 
-    supported = _SSE_PREFIXES + _SZSE_PREFIXES + _FUND_PREFIXES
-    if not code.startswith(supported):
+    if ashare_exchange(code) is None:
         raise _no_market(
             symbol,
             f"A-share code '{code}' is outside the auto-supported SSE/SZSE "
@@ -116,7 +110,7 @@ def to_acode(symbol: str) -> str:
 def to_em_symbol(symbol: str) -> str:
     """Exchange-prefixed form used by EastMoney report-sheet endpoints."""
     code = to_acode(symbol)
-    prefix = "SH" if code.startswith(_SSE_PREFIXES) else "SZ"
+    prefix = ashare_exchange(code) or "SZ"
     return f"{prefix}{code}"
 
 

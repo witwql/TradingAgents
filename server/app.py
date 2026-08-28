@@ -141,9 +141,10 @@ def _fetch_sina_spot(codes: list[str]) -> dict[str, dict]:
 
 def _sina_code(bare: str) -> str:
     """510300 -> sh510300 / 159994 -> sz159994 / 600519 -> sh600519."""
-    if bare.startswith(("51", "56", "58", "60", "68")):
-        return f"sh{bare}"
-    return f"sz{bare}"
+    from tradingagents.dataflows.symbol_utils import ashare_exchange
+
+    exchange = ashare_exchange(bare) or "SZ"
+    return exchange.lower() + bare
 
 # Secret-free settings surface: values the dashboard may read/write.
 _SETTING_KEYS = {

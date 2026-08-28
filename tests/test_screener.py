@@ -197,3 +197,32 @@ class TestLatestRunResilience:
         )
         run = latest_run(db)
         assert run["results"]["evaluated"] == 1
+
+
+class TestScreenRunAtomicity:
+    """只验证 DB 原子语义；线程体 mock 掉——否则后台线程会真实拉网络，
+    并通过模块级 ss.ak 泄漏 mock 计数污染后续测试（复盘实测踩中）。"""
+
+    @pytest.fixture(autouse=True)
+    def _no_worker(self, monkeypatch):
+        monkeypatch.setattr(sc, "_run_blocking", lambda *a, **k: None)
+
+    def test_double_start_reuses_running_run(self, tmp_path):
+        from server.db import Database
+        from server.screener import run_screening
+
+        db = Database(tmp_path / "s.db")
+        id1, reused1 = run_screening(db)
+        id2, reused2 = run_screening(db)
+        assert reused1 is False and reused2 is True
+        assert id1 == id2
+
+    def test_after_done_new_run_spawns(self, tmp_path):
+        from server.db import Database
+        from server.screener import run_screening
+
+        db = Database(tmp_path / "s.db")
+        id1, _ = run_screening(db)
+        db.execute("UPDATE screen_runs SET status='done' WHERE id=?", (id1,))
+        id2, reused = run_screening(db)
+        assert reused is False and id2 != id1

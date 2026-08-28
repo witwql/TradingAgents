@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Breaking changes within the 0.x line are called out explicitly.
 
+## Unreleased
+
+### Added
+- **A-share data vendors**: AKShare (EastMoney/THS) and Sina as first-class
+  vendor families with declared fallback chains (`sina,akshare,yfinance`),
+  in-market ETF support (51/56/58/15 codes), bare-code auto-resolution
+  (`600519` → `600519.SS`), and throttle-shaped degradation sentinels instead
+  of aborted runs. `pip install "tradingagents[akshare]"`.
+- **Local web dashboard** (`server/`, `pip install ".[dashboard]"`,
+  `tradingagents-dashboard`): task queue with SQLite persistence, SSE
+  per-agent live output stream (LLM calls + tool executions attributed to
+  graph nodes), markdown report center, watchlist with background-refreshed
+  quotes, GLM settings panel.
+- **Global Macro Analyst** (optional 5th analyst): COMEX gold, WTI crude,
+  US Treasury 2Y/10Y, US indices, main-capital money flow (超大单+大单 with
+  price-flow divergence detection), and a quantitative factor-exposure model
+  (per-factor correlation/beta + composite overnight score, T-1 overseas
+  session → T-day transmission). Reports thread into the research debate,
+  trader and portfolio-manager prompts.
+- **Next-day picks screener** (dashboard "明日精选"): main-board universe,
+  five binary setups scored by each stock's own 500-day conditional
+  frequencies; ≥80% probability gate with ≤5 picks, live progress, run
+  history, watchlist for near-misses.
+
+### Fixed
+- py-mini-racer (V8) hard-abort when akshare calls ran on multiple threads —
+  all akshare invocations now serialize through a process-wide lock.
+- yfinance 429s and repeated transport aborts classify as
+  `VendorRateLimitError`, so multi-vendor chains skip instead of dying.
+- Verified market snapshot degrades to a sentinel when no OHLCV source is
+  reachable, instead of raising through ToolNode.
+- Screen-run double-start race made atomic; task cancel/claim race guarded;
+  task_events now pruned to the most recent 50 tasks.
+
+### Changed
+- `load_ohlcv` and the verified snapshot follow the configured vendor chain
+  (previously hardwired to yfinance).
+- Runner configs are scoped per run (`config_scope`) instead of mutating
+  process-global state.
+
 ## [0.3.1] — 2026-07-05
 
 Correctness and stability patch: data look-ahead, graph-router crash-safety,
