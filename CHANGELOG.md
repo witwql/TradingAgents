@@ -39,6 +39,9 @@ Breaking changes within the 0.x line are called out explicitly.
   reachable, instead of raising through ToolNode.
 - Screen-run double-start race made atomic; task cancel/claim race guarded;
   task_events now pruned to the most recent 50 tasks.
+- tools/frontend_replay.js: replays app.js against a minimal DOM shim and the
+  live backend, exposing runtime errors API tests cannot see; a new
+  frontend-consistency test guards against silent HTML/JS drift.
 
 ### Changed
 - `load_ohlcv` and the verified snapshot follow the configured vendor chain

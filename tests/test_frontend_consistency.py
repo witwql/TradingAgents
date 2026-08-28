@@ -21,11 +21,13 @@ class TestFrontendConsistency:
         assert css_v.group(1) == js_v.group(1), "css/js 版本号不一致"
 
     def test_ids_referenced_by_js_exist_in_html_or_js_templates(self):
-        # JS 模板字符串里动态创建的 id 也算存在（全文合并提取）
+        # JS 模板字符串里动态创建的 id 也算存在；createElement 后以 .id =
+        # 赋值的方式创建的同样合法（如 report-files）。
         combined = HTML + JS
         html_ids = set(re.findall(r'id="([\w-]+)"', combined))
+        dyn_ids = set(re.findall(r'\.id\s*=\s*"([\w-]+)"', JS))
         js_refs = set(re.findall(r'\$\("#([\w-]+)"\)', JS))
-        missing = sorted(js_refs - html_ids)
+        missing = sorted(js_refs - html_ids - dyn_ids)
         assert not missing, f"app.js 引用了不存在的元素 id: {missing}"
 
     def test_picks_page_functions_present(self):
