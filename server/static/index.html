@@ -95,8 +95,9 @@
         <span id="ss-stage" class="ss-stage">准备中…</span>
         <span id="ss-count" class="ss-count"></span>
         <span id="ss-elapsed" class="ss-elapsed muted"></span>
+        <button class="btn small danger" id="ss-stop" onclick="cancelScreening()">■ 停止</button>
       </div>
-      <div class="mini-bar" style="max-width:none;margin-top:10px"><i id="ss-bar" style="width:0%"></i></div>
+      <div class="mini-bar indeterminate" id="ss-bar-wrap" style="max-width:none;margin-top:10px"><i id="ss-bar" style="width:0%"></i></div>
       <div id="ss-hint" class="muted" style="font-size:11.5px;margin-top:6px"></div>
     </div>
 

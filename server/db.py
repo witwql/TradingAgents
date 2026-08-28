@@ -98,6 +98,7 @@ class Database:
             ("screen_runs", "processed", "INTEGER NOT NULL DEFAULT 0"),
             ("screen_runs", "total", "INTEGER NOT NULL DEFAULT 0"),
             ("screen_runs", "qualifying", "INTEGER NOT NULL DEFAULT 0"),
+            ("screen_runs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
         ):
             cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
             if column not in cols:
@@ -202,6 +203,41 @@ class Database:
             self._conn.commit()
         refreshed = self.get_task(task["id"])
         return refreshed if refreshed and refreshed["status"] == "running" else None
+
+    def request_screen_cancel(self, run_id: str) -> bool:
+        """Cooperative cancellation: flag the run; the worker checks per item."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE screen_runs SET cancel_requested=1 WHERE id=? AND status='running'",
+                (run_id,),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def sweep_interrupted(self, max_running_age: float = 1800) -> dict[str, int]:
+        """Fail stale 'running' rows left by a server restart/crash.
+
+        A running screening older than ``max_running_age`` and any running
+        analysis task cannot still be alive after a fresh boot; marking them
+        here prevents UIs from waiting on ghosts forever.
+        """
+        now = time.time()
+        counts = {"screen_runs": 0, "tasks": 0}
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE screen_runs SET status='failed', error='服务重启，运行中断',"
+                " finished_at=? WHERE status='running' AND created_at < ?",
+                (now, now - max_running_age),
+            )
+            counts["screen_runs"] = cur.rowcount
+            cur = self._conn.execute(
+                "UPDATE tasks SET status='failed', error='服务重启，运行中断',"
+                " finished_at=? WHERE status='running' AND started_at < ?",
+                (now, now - max_running_age),
+            )
+            counts["tasks"] = cur.rowcount
+            self._conn.commit()
+        return counts
 
     def begin_screen_run(self, run_id: str, trade_date: str, reuse_window: float = 1800) -> tuple[str, bool]:
         """Atomically create a screening run or reuse an in-flight one.

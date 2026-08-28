@@ -351,3 +351,68 @@ class TestScreeningScheduler:
                                trigger=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fire")))
         s._tick(lambda *a, **k: None)
         assert s._last_fired_date == "2026-08-26"
+
+
+class TestInterruptedSweepAndCancel:
+    def test_sweep_fails_stale_running_rows(self, tmp_path):
+        import time as _t
+
+        from server.db import Database
+
+        db = Database(tmp_path / "s.db")
+        # 屏幕运行：旧的 running 应被清扫，新的保留
+        db.execute(
+            "INSERT INTO screen_runs (id, created_at, status) VALUES ('old', ?, 'running')",
+            (_t.time() - 7200,),
+        )
+        db.execute(
+            "INSERT INTO screen_runs (id, created_at, status) VALUES ('fresh', ?, 'running')",
+            (_t.time(),),
+        )
+        # 分析任务同理
+        tid = db.create_task({"ticker": "600519", "trade_date": "2026-08-28"})
+        db.update_task(tid, status="running", started_at=_t.time() - 7200)
+
+        counts = db.sweep_interrupted(max_running_age=1800)
+        assert counts["screen_runs"] == 1
+        assert counts["tasks"] == 1
+        assert db.fetchone("SELECT status FROM screen_runs WHERE id='old'")["status"] == "failed"
+        assert db.fetchone("SELECT status FROM screen_runs WHERE id='fresh'")["status"] == "running"
+        assert db.get_task(tid)["status"] == "failed"
+
+    def test_cancel_flag_request(self, tmp_path):
+        from server.db import Database
+
+        db = Database(tmp_path / "s.db")
+        db.execute(
+            "INSERT INTO screen_runs (id, created_at, status) VALUES ('r1', ?, 'running')",
+            (__import__("time").time(),),
+        )
+        assert db.request_screen_cancel("r1") is True
+        assert db.fetchone("SELECT cancel_requested FROM screen_runs WHERE id='r1'")["cancel_requested"] == 1
+        # 已结束的运行不可取消
+        db.execute("UPDATE screen_runs SET status='done' WHERE id='r1'")
+        assert db.request_screen_cancel("r1") is False
+
+    def test_run_blocking_honours_cancel_flag(self, tmp_path, monkeypatch):
+        """预置取消标志 → 线程体立即终止为 cancelled。"""
+        import time as _t
+
+        import server.screener as sc
+        from server.db import Database
+
+        db = Database(tmp_path / "s.db")
+        run_id = "rc1"
+        db.execute(
+            "INSERT INTO screen_runs (id, created_at, status, trade_date, stage, cancel_requested)"
+            " VALUES (?, ?, 'running', '2026-08-28', 'analyzing', 1)",
+            (run_id, _t.time()),
+        )
+        monkeypatch.setattr(sc, "fetch_universe", lambda: [
+            {"code": "600519", "name": "贵州茅台", "price": 1290.0, "turnover": 3e9}])
+        monkeypatch.setattr(sc, "evaluate_stock", lambda *a, **k: None)  # never needed
+
+        sc._run_blocking(db, run_id, "2026-08-28")
+        row = db.fetchone("SELECT status, results FROM screen_runs WHERE id=?", (run_id,))
+        assert row["status"] == "cancelled"
+        assert '"cancelled": true' in row["results"]

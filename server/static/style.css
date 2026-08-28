@@ -301,3 +301,12 @@ h3 { font-size: 15px; margin-bottom: 10px; }
 .toast .t-sub { color: var(--muted); font-size: 12px; }
 @keyframes toastIn { from { transform: translateY(14px); opacity: 0; } }
 @keyframes toastOut { to { opacity: 0; transform: translateY(8px); } }
+
+.mini-bar.indeterminate { position: relative; overflow: hidden; }
+.mini-bar.indeterminate i {
+  width: 30% !important;
+  background: repeating-linear-gradient(45deg, var(--accent), var(--accent) 8px, #7ab0ff 8px, #7ab0ff 16px);
+  animation: slide 1.1s linear infinite;
+}
+@keyframes slide { from { margin-left: -30%; } to { margin-left: 100%; } }
+.btn.danger.solid { background: var(--red); border-color: var(--red); color: #fff; }

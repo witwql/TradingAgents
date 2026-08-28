@@ -172,6 +172,9 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
 
     from .scheduler import ScreeningScheduler
 
+    sweep = db.sweep_interrupted()
+    if sweep.get("screen_runs") or sweep.get("tasks"):
+        logger.warning("swept interrupted runs: %s", sweep)
     scheduler = ScreeningScheduler(db)
     if start_spot:
         scheduler.start()
@@ -377,6 +380,15 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
         run_id, already_running = run_screening(db)
         return {"run_id": run_id, "already_running": already_running}
 
+    @app.post("/api/screen/cancel")
+    async def screen_cancel(request: Request):
+        body = await request.json()
+        run_id = str(body.get("run_id", ""))
+        ok = db.request_screen_cancel(run_id)
+        if not ok:
+            raise HTTPException(409, "运行不存在或已结束")
+        return {"cancelling": run_id}
+
     @app.get("/api/screen/history")
     def screen_history(limit: int = 10):
         from .screener import history
@@ -406,6 +418,7 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
                 "qualifying": (run["results"] or {}).get("qualifying"),
                 "picks": (run["results"] or {}).get("picks", []),
                 "watchlist": (run["results"] or {}).get("watchlist", []),
+                "cancelled_flag": (run["results"] or {}).get("cancelled", False),
             }
         }
 

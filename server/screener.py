@@ -337,6 +337,7 @@ def _run_blocking(db, run_id: str, curr_date: str | None):
 
         results = []
         done_count = 0
+        cancelled = False
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {
                 pool.submit(evaluate_stock, u["code"], u["name"], u["price"], curr): u
@@ -349,14 +350,39 @@ def _run_blocking(db, run_id: str, curr_date: str | None):
                     results.append(r)
                 # Live progress: every finished future counts toward the bar,
                 # even when the stock produced no composite (fewer than
-                # MIN_FACTORS_FIRED) — otherwise the bar would jumpp.
+                # MIN_FACTORS_FIRED) — otherwise the bar would jump.
                 qualifying_now = sum(
                     1 for x in results if x["probability"] >= PROBABILITY_THRESHOLD
                 )
+                flag = db.fetchone(
+                    "SELECT cancel_requested FROM screen_runs WHERE id=?", (run_id,)
+                )
+                if flag and flag["cancel_requested"]:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    cancelled = True
+                    break
                 db.execute(
                     "UPDATE screen_runs SET processed=?, qualifying=? WHERE id=?",
                     (done_count, qualifying_now, run_id),
                 )
+
+        if cancelled:
+            payload = json.dumps({
+                "evaluated": len(results),
+                "qualifying": sum(
+                    1 for x in results if x["probability"] >= PROBABILITY_THRESHOLD
+                ),
+                "picks": [],
+                "watchlist": split_results(results)[1],
+                "cancelled": True,
+            }, ensure_ascii=False)
+            db.execute(
+                "UPDATE screen_runs SET status='cancelled', finished_at=?,"
+                " processed=?, results=? WHERE id=?",
+                (time.time(), done_count, payload, run_id),
+            )
+            logger.info("screener run %s cancelled at %d/%d", run_id, done_count, len(universe))
+            return
 
         picks, watchlist = split_results(results)
 

@@ -24,7 +24,7 @@ const STAGE_TEXT = {
   bull_researcher: "多方研究", bear_researcher: "空方研究", research_manager: "研究裁决",
   trader: "交易决策", risk_debate: "风险辩论", portfolio_manager: "终审",
 };
-const state = { filterStatus: "", drawerTaskId: null, drawerES: null, cache: {}, feedCount: 0, feedScroll: true };
+const state = { filterStatus: "", drawerTaskId: null, drawerES: null, cache: {}, feedCount: 0, feedScroll: true, lastScreenRun: null };
 
 /* ---------------- router ---------------- */
 const VIEWS = ["dashboard", "new", "tasks", "picks", "reports", "favorites", "settings"];
