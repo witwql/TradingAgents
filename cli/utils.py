@@ -18,6 +18,7 @@ ANALYST_ORDER = [
     ("Sentiment Analyst", AnalystType.SOCIAL),
     ("News Analyst", AnalystType.NEWS),
     ("Fundamentals Analyst", AnalystType.FUNDAMENTALS),
+    ("Global Macro Analyst (金/油/美债/美股)", AnalystType.MACRO),
 ]
 
 CRYPTO_SUFFIXES = ("-USD", "-USDT", "-USDC", "-BTC", "-ETH")
@@ -92,11 +93,8 @@ def filter_analysts_for_asset_type(
 ) -> list[AnalystType]:
     if asset_type != AssetType.CRYPTO:
         return analysts
-    return [
-        analyst
-        for analyst in analysts
-        if analyst != AnalystType.FUNDAMENTALS
-    ]
+    excluded = {AnalystType.FUNDAMENTALS, AnalystType.MACRO}
+    return [analyst for analyst in analysts if analyst not in excluded]
 
 
 def get_analysis_date() -> str:

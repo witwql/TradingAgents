@@ -169,6 +169,21 @@ def build_instrument_context(
     return context
 
 
+def get_macro_section(state) -> str:
+    """Formatted global-macro factor section for downstream prompts.
+
+    Empty string when the macro analyst is not selected, so existing prompt
+    shapes stay byte-identical for runs without it.
+    """
+    report = state.get("macro_report") or ""
+    if not report.strip():
+        return ""
+    return (
+        "\nGlobal macro factor report (international gold / crude oil / "
+        "US Treasury yields / US equities):\n" + report + "\n"
+    )
+
+
 def get_instrument_context_from_state(state: Mapping[str, Any]) -> str:
     """Return the instrument context for the current run.
 

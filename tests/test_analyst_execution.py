@@ -19,7 +19,11 @@ class AnalystExecutionPlanTests(unittest.TestCase):
 
     def test_rejects_unknown_analyst_keys(self):
         with self.assertRaises(ValueError):
-            build_analyst_execution_plan(["market", "macro"])
+            build_analyst_execution_plan(["market", "astrology"])
+
+    def test_macro_analyst_is_a_known_key(self):
+        plan = build_analyst_execution_plan(["macro"])
+        self.assertEqual([s.key for s in plan.specs], ["macro"])
 
     def test_get_initial_analyst_node_uses_plan_metadata(self):
         plan = build_analyst_execution_plan(["fundamentals", "news"])

@@ -50,6 +50,15 @@ ANALYST_NODE_SPECS: dict[str, AnalystNodeSpec] = {
         tool_node="tools_fundamentals",
         report_key="fundamentals_report",
     ),
+    "macro": AnalystNodeSpec(
+        # Global macro analyst: gold / crude / US yields / US equities factor
+        # team (optional; A-share oriented).
+        key="macro",
+        agent_node="Global Macro Analyst",
+        clear_node="Msg Clear Macro",
+        tool_node="tools_macro",
+        report_key="macro_report",
+    ),
 }
 
 

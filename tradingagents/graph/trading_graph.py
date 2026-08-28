@@ -29,6 +29,14 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.global_macro import (
+    get_crude_oil_price,
+    get_factor_exposure,
+    get_gold_price,
+    get_money_flow,
+    get_us_stock_indices,
+    get_us_treasury_yields,
+)
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_llm_client
@@ -71,6 +79,8 @@ class TradingAgentsGraph:
         debug=False,
         config: dict[str, Any] = None,
         callbacks: list | None = None,
+        progress_callback=None,
+        runtime_callbacks: list | None = None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -79,10 +89,24 @@ class TradingAgentsGraph:
             debug: Whether to run in debug mode
             config: Configuration dictionary. If None, uses default config
             callbacks: Optional list of callback handlers (e.g., for tracking LLM/tool stats)
+            progress_callback: Optional callable invoked with small event dicts as the
+                graph advances ({"type": "node_done", "node": "<LangGraph node name>"}).
+                Used by UIs to visualize workflow progress; failures in the callback
+                never affect the run.
+            runtime_callbacks: Optional LangChain callback handlers attached to the
+                graph's invoke config, so every nested LLM/tool call inside agent
+                nodes streams through them (per-agent activity feeds).
         """
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
+        # Only explicit callables enable the streaming progress path; stored
+        # separately from a plain attribute so duck-typed stand-ins (test
+        # doubles bound via functools.partial) keep taking the invoke() path.
+        self._progress_hook = progress_callback if callable(progress_callback) else None
+        self.progress_callback = self._progress_hook
+        # Same __dict__-only storage contract as _progress_hook (see above).
+        self._runtime_callbacks = list(runtime_callbacks or [])
 
         # Update the interface's config
         set_config(self.config)
@@ -225,6 +249,17 @@ class TradingAgentsGraph:
                     get_income_statement,
                 ]
             ),
+            "macro": ToolNode(
+                [
+                    # Global macro factor tools (gold/oil/US yields/US equities/money flow)
+                    get_gold_price,
+                    get_crude_oil_price,
+                    get_us_treasury_yields,
+                    get_us_stock_indices,
+                    get_money_flow,
+                    get_factor_exposure,
+                ]
+            ),
         }
 
     def _resolve_benchmark(self, ticker: str) -> str:
@@ -359,6 +394,20 @@ class TradingAgentsGraph:
             f"asset={asset_type}",
         ])
 
+    def _emit_progress(self, event: dict[str, Any]) -> None:
+        """Forward a progress event to the callback, never raising outward."""
+        # Read straight from ``__dict__`` rather than via attribute lookup:
+        # ``_run_graph`` can be bound onto duck-typed doubles (see the
+        # memory-log regression test) whose auto-generated attributes are
+        # always truthy and would silently flip execution onto the wrong path.
+        cb = self.__dict__.get("_progress_hook")
+        if cb is None:
+            return
+        try:
+            cb(event)
+        except Exception:
+            logger.debug("progress callback raised", exc_info=True)
+
     def propagate(self, company_name, trade_date, asset_type: str = "stock"):
         """Run the trading agents graph for a company on a specific date.
 
@@ -430,6 +479,10 @@ class TradingAgentsGraph:
             instrument_context=instrument_context,
         )
         args = self.propagator.get_graph_args()
+        hooks = self.__dict__.get("_runtime_callbacks") or []
+        if hooks:
+            cfg = args.setdefault("config", {})
+            cfg["callbacks"] = [*cfg.get("callbacks", []), *hooks]
 
         # Inject thread_id so same ticker+date+graph-shape resumes; a different
         # date or graph shape starts fresh (#1089).
@@ -456,6 +509,20 @@ class TradingAgentsGraph:
             final_state = {}
             for chunk in trace:
                 final_state.update(chunk)
+        elif self.__dict__.get("_progress_hook") is not None:
+            # UI progress mode: stream node updates alongside value snapshots.
+            # "updates" names the LangGraph node that just finished; the final
+            # "values" snapshot is the full end state (equal to invoke()).
+            graph_args = {k: v for k, v in args.items() if k != "stream_mode"}
+            final_state = {}
+            for mode, payload in self.graph.stream(
+                init_agent_state, stream_mode=["updates", "values"], **graph_args
+            ):
+                if mode == "updates" and isinstance(payload, dict):
+                    for node_name in payload:
+                        self._emit_progress({"type": "node_done", "node": str(node_name)})
+                elif mode == "values" and isinstance(payload, dict):
+                    final_state = payload
         else:
             final_state = self.graph.invoke(init_agent_state, **args)
 
@@ -489,7 +556,8 @@ class TradingAgentsGraph:
             "market_report": final_state["market_report"],
             "sentiment_report": final_state["sentiment_report"],
             "news_report": final_state["news_report"],
-            "fundamentals_report": final_state["fundamentals_report"],
+            "fundamentals_report": final_state.get("fundamentals_report", ""),
+            "macro_report": final_state.get("macro_report", ""),
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],
                 "bear_history": final_state["investment_debate_state"]["bear_history"],
