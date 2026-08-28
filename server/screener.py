@@ -142,22 +142,49 @@ def compute_factors(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
+def append_money_flow_factor(d: pd.DataFrame, flow: pd.DataFrame) -> pd.DataFrame:
+    """F6 主力资金净流入配合: 当日净占比>0 且 5日累计净额>0。
+
+    Flow dates are inner-matched to OHLCV dates; days without flow data are
+    False, so a throttled EastMoney simply yields a 5-factor evaluation.
+    """
+    if flow is None or flow.empty:
+        return d
+    f = flow[["_d", "主力净流入-净占比", "主力净流入-净额"]].copy()
+    f["Date"] = f["_d"].dt.normalize()
+    f["main_pct"] = pd.to_numeric(f["主力净流入-净占比"], errors="coerce")
+    f["main_amt"] = pd.to_numeric(f["主力净流入-净额"], errors="coerce")
+    f["amt5"] = f["main_amt"].rolling(5).sum()
+    f["f6"] = (f["main_pct"] > 0) & (f["amt5"] > 0)
+    mapping = dict(zip(f["Date"], f["f6"], strict=False))
+    d = d.copy()
+    d["f6_money"] = pd.to_datetime(d["Date"]).map(mapping).fillna(False).astype(bool)
+    return d
+
+
 FACTOR_LABELS = {
     "f1_pullback": "多头排列回踩MA10",
     "f2_breakout": "放量突破20日高",
     "f3_macd": "MACD零上金叉/红柱放大",
     "f4_rsi": "RSI强势区上行",
     "f5_shrink_stabilize": "缩量回踩收阳企稳",
+    "f6_money": "主力资金净流入配合",
 }
 
+# 价格五因子必然存在；f6 依赖资金流数据（EM 限流时优雅缺席）。
 FACTOR_COLUMNS = list(FACTOR_LABELS.keys())
+PRICE_FACTOR_COLUMNS = list(FACTOR_LABELS.keys())[:5]
+
+
+def _active_factor_columns(d: pd.DataFrame) -> list[str]:
+    return [c for c in FACTOR_COLUMNS if c in d.columns]
 
 
 def _factor_stats(d: pd.DataFrame) -> dict[str, tuple[float, int]]:
     """Per-factor historical P(next-day up | fired) + sample count."""
     next_up = (d["Close"].shift(-1) > d["Close"]).astype(float)
     stats = {}
-    for col in FACTOR_COLUMNS:
+    for col in _active_factor_columns(d):
         fired = d[col] == True  # noqa: E712 — pandas boolean mask
         n = int(fired.sum())
         if n >= MIN_FACTOR_SAMPLES:
@@ -178,7 +205,7 @@ def _composite_probability(d: pd.DataFrame, stats: dict) -> tuple[float | None, 
     p0 = min(max(p0, 0.35), 0.65)  # degenerate-history guard
 
     fired, contributions, weight_sum, lift_sum = 0, [], 0.0, 0.0
-    for col in FACTOR_COLUMNS:
+    for col in _active_factor_columns(d):
         if not bool(d[col].iloc[-1]):
             continue
         p, n = stats[col]
@@ -209,7 +236,7 @@ def _composite_probability(d: pd.DataFrame, stats: dict) -> tuple[float | None, 
 
 def _resonance_calibration(d: pd.DataFrame) -> tuple[float | None, int]:
     """Historical hit-rate on days when >=3 factors co-fired (calibration)."""
-    fired_count = d[FACTOR_COLUMNS].sum(axis=1)
+    fired_count = d[_active_factor_columns(d)].sum(axis=1)
     resonance = fired_count >= MIN_FACTORS_FIRED
     n = int(resonance.sum())
     if n < 5:
@@ -245,6 +272,20 @@ def evaluate_stock(code: str, name: str, price: float, curr_date: str) -> dict |
 
     stats = _factor_stats(d)
     prob, contributions, fired = _composite_probability(d, stats)
+
+    # 两阶段：只有价格因子已显潜力的候选（fired>=2）才值得花一次东财调用
+    # 拉主力资金复核（f6 可抬升/压低最终概率）；限流期全量拉 120 次既慢又几乎全败。
+    if fired >= 2:
+        try:
+            from tradingagents.dataflows.money_flow import fetch_money_flow
+
+            flow = fetch_money_flow(code, curr_date, 60, retries=1)
+            d = append_money_flow_factor(d, flow)
+            stats = _factor_stats(d)
+            prob, contributions, fired = _composite_probability(d, stats)
+        except Exception as exc:
+            logger.debug("screener: money flow unavailable for %s: %s", code, exc)
+
     if prob is None:
         return None
 

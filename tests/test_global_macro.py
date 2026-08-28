@@ -188,35 +188,45 @@ class TestMoneyFlow:
         })
 
     def test_flow_report_streak_and_levels(self, monkeypatch):
-        import tradingagents.dataflows.global_macro as g
+        import tradingagents.dataflows.money_flow as mf
 
         fake = mock.Mock()
         fake.stock_individual_fund_flow.return_value = self._flow_frame()
-        monkeypatch.setattr(g, "ak", fake)
+        monkeypatch.setattr(mf, "ak", fake)
+        monkeypatch.setattr(mf, "get_config",
+                            lambda: {"data_cache_dir": __import__("tempfile").mkdtemp()})
+        import tradingagents.dataflows.global_macro as g
         out = g.get_money_flow.func("600519.SS", "2026-06-24", 30)
         assert "主力资金流" in out
         assert "连续净流入 5 天" in out
         assert "5日主力净额合计" in out and "亿" in out
 
     def test_flow_lookahead_cutoff(self, monkeypatch):
-        import tradingagents.dataflows.global_macro as g
+        import tradingagents.dataflows.money_flow as mf
 
         fake = mock.Mock()
         fake.stock_individual_fund_flow.return_value = self._flow_frame()
-        monkeypatch.setattr(g, "ak", fake)
+        monkeypatch.setattr(mf, "ak", fake)
+        monkeypatch.setattr(mf, "get_config",
+                            lambda: {"data_cache_dir": __import__("tempfile").mkdtemp()})
+        import tradingagents.dataflows.global_macro as g
         out = g.get_money_flow.func("600519.SS", "2026-06-10", 30)
         assert "截至 2026-06-10" in out
         assert "2026-06-24" not in out
 
     def test_divergence_warning(self, monkeypatch):
-        import tradingagents.dataflows.global_macro as g
+        import tradingagents.dataflows.money_flow as mf
 
         frame = self._flow_frame()
         # 近3日价跌 + 资金净流入 → 吸筹信号分支
         frame.loc[frame.index[-3:], "收盘价"] = [100.0, 99.0, 98.0]
         fake = mock.Mock()
         fake.stock_individual_fund_flow.return_value = frame
-        monkeypatch.setattr(g, "ak", fake)
+        monkeypatch.setattr(mf, "ak", fake)
+        monkeypatch.setattr(mf, "get_config",
+                            lambda: {"data_cache_dir": __import__("tempfile").mkdtemp()})
+        import tradingagents.dataflows.global_macro as g
+        import tradingagents.dataflows.global_macro as g
         out = g.get_money_flow.func("600519.SS", "2026-06-24", 30)
         assert "逆向吸筹" in out
 
@@ -241,6 +251,10 @@ class TestMoneyFlow:
         fake.index_us_stock_sina.side_effect = lambda *, symbol: spx
         fake.stock_individual_fund_flow.return_value = flow
         monkeypatch.setattr(gm, "ak", fake)
+        import tradingagents.dataflows.money_flow as mf
+        monkeypatch.setattr(mf, "ak", fake)
+        monkeypatch.setattr(mf, "get_config",
+                            lambda: {"data_cache_dir": __import__("tempfile").mkdtemp()})
 
         target = pd.DataFrame({
             "Date": dates, "Open": 10.0, "High": 11.0, "Low": 9.0,

@@ -387,6 +387,20 @@ function toggleFeedScroll() {
 /* ---------------- 明日精选 ---------------- */
 function loadPicks() { pollScreening(false); }
 
+async function deepResearch(code) {
+  try {
+    const { task_ids } = await api("/tasks", {
+      method: "POST",
+      body: { tickers: [code], output_language: "Chinese" },
+    });
+    showToast("深度研究已排队", `${code} · 全分析师团队 · 打开任务面板查看进度`);
+    go("#tasks");
+    openDrawer(task_ids[0]);
+  } catch (e) {
+    showToast("排队失败", e.message, true);
+  }
+}
+
 async function startScreening() {
   const btn = $("#screen-run");
   btn.disabled = true; btn.textContent = "筛选中…(约1-3分钟)";
@@ -458,6 +472,7 @@ function pickCard(p, idx, muted = false) {
         <div class="num" style="color:${probColor}">${pct}%</div>
         <div class="lbl">P(次日上涨)</div>
       </div>
+      <button class="btn small primary" onclick="event.stopPropagation();deepResearch('${p.code}')">🔬 深度研究</button>
     </div>
     <div class="prob-bar"><i style="width:${pct}%"></i></div>
     <div class="factor-chips">${chips}</div>
@@ -564,6 +579,7 @@ async function loadSettings() {
   $("#s-deep").value = settings.deep_model || settings.glm_model || "glm-5.2";
   $("#s-quick").value = settings.quick_model || "";
   $("#s-temp").value = settings.temperature || "";
+  $("#s-autoscreen").value = settings.auto_screen_time || "15:30";
   const hasKey = settings.glm_region === "glm" ? health.has_zhipu_intl_key : health.has_zhipu_cn_key;
   $("#key-state").textContent = hasKey
     ? `✅ 已检测到 API Key（区域：${settings.glm_region === "glm" ? "Z.AI 国际站" : "BigModel 中国区"}），可以直接提交分析。`
@@ -582,6 +598,8 @@ async function saveSettings(ev) {
   body.deep_model = deep; body.glm_model = deep;
   if (quick) body.quick_model = quick;
   if (temp && !isNaN(+temp)) body.temperature = temp;
+  const autoscreen = $("#s-autoscreen").value.trim();
+  body.auto_screen_time = autoscreen || "off";
   try {
     await api("/settings", { method: "PUT", body });
     $("#settings-msg").textContent = "已保存 ✓";

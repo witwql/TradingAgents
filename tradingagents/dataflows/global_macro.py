@@ -216,32 +216,17 @@ def get_money_flow(
     lookback_days: Annotated[int, "calendar days of flow history to summarize"] = 30,
 ) -> str:
     """主力资金 (main-capital = 超大单+大单) daily net-flow history and derived
-    signals: latest day, 1d/5d/20d aggregates, consecutive-flow streaks, and a
+    signals: latest day, 5d/20d aggregates, consecutive-flow streaks, and a
     price-vs-flow divergence flag (价涨资金流出 = distribution risk)."""
-    code = str(symbol).strip().upper().rstrip("+")
-    from .symbol_utils import ashare_exchange
+    from .money_flow import fetch_money_flow
 
-    bare = code.split(".")[0]
-    market = (ashare_exchange(bare) or "SZ").lower()
+    flow = fetch_money_flow(symbol, curr_date, max(lookback_days, 25))
 
-    raw = _quiet(ak.stock_individual_fund_flow, stock=bare, market=market)
-    if raw is None or raw.empty:
-        raise NoMarketDataError(symbol, code, "no money-flow rows returned")
+    main = pd.to_numeric(flow["主力净流入-净占比"], errors="coerce")
+    main_amt = pd.to_numeric(flow["主力净流入-净额"], errors="coerce")
+    super_amt = pd.to_numeric(flow.get("超大单净流入-净额"), errors="coerce")
+    close = pd.to_numeric(flow["收盘价"], errors="coerce")
 
-    raw["_d"] = pd.to_datetime(raw["日期"], errors="coerce")
-    raw = raw[raw["_d"].notna() & (raw["_d"] <= pd.Timestamp(curr_date))]
-    raw = raw[raw["_d"] >= pd.Timestamp(curr_date) - pd.Timedelta(days=max(lookback_days, 25))]
-    if raw.empty:
-        raise NoMarketDataError(symbol, code, f"no flow rows on or before {curr_date}")
-
-    main = pd.to_numeric(raw["主力净流入-净占比"], errors="coerce")
-    main_amt = pd.to_numeric(raw["主力净流入-净额"], errors="coerce")
-    super_amt = pd.to_numeric(raw.get("超大单净流入-净额"), errors="coerce")
-    close = pd.to_numeric(raw["收盘价"], errors="coerce")
-
-    days = raw["_d"]
-
-    # 连续净流入/流出天数（以主力净额符号计）
     streak = 0
     for v in reversed(main_amt.dropna().tolist()):
         if streak == 0:
@@ -256,7 +241,6 @@ def get_money_flow(
     def yi(v):
         return f"{v / 1e8:+.2f}亿" if pd.notna(v) else "N/A"
 
-    # 量价背离：近3日累计上涨但主力累计净流出
     up3 = close.iloc[-1] - close.iloc[-4] if len(close) >= 4 else None
     flow3 = main_amt.iloc[-3:].sum()
     divergence = ""
@@ -268,7 +252,7 @@ def get_money_flow(
 
     return (
         f"# 主力资金流 (EastMoney, 主力=超大单+大单)\n"
-        f"- 截至 {days.iloc[-1].date()}\n"
+        f"- 截至 {flow['_d'].iloc[-1].date()}\n"
         f"- 最新主力净额: {yi(main_amt.iloc[-1])}（净占比 {main.iloc[-1]:+.2f}%）\n"
         f"- 其中超大单净额: {yi(super_amt.iloc[-1])}\n"
         f"- 5日主力净额合计: {yi(main_amt.iloc[-5:].sum())}\n"
@@ -315,17 +299,11 @@ def _factor_returns(symbol: str, curr_date: str, lookback_days: int) -> dict[str
 
     # 主力资金净占比（pct-point 日变化）——EM 限流时优雅跳过
     try:
-        from .symbol_utils import ashare_exchange
+        from .money_flow import fetch_money_flow
 
-        bare = to_bare(symbol)
-        raw = _quiet(
-            ak.stock_individual_fund_flow, stock=bare,
-            market=(ashare_exchange(bare) or "SZ").lower(),
-        )
-        raw["_d"] = pd.to_datetime(raw["日期"], errors="coerce")
-        raw = raw[raw["_d"].notna()]
-        s = pd.to_numeric(raw["主力净流入-净占比"], errors="coerce").diff()
-        out["MFLOW"] = pd.Series(s.values, index=raw["_d"]).shift(1)
+        flow = fetch_money_flow(symbol, curr_date, lookback_days * 2)
+        s = pd.to_numeric(flow["主力净流入-净占比"], errors="coerce").diff()
+        out["MFLOW"] = pd.Series(s.values, index=flow["_d"]).shift(1)
     except Exception as exc:
         logger.info("factor exposure: money flow skipped (%s)", exc)
 

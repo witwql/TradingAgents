@@ -149,6 +149,7 @@ def _sina_code(bare: str) -> str:
 # Secret-free settings surface: values the dashboard may read/write.
 _SETTING_KEYS = {
     "glm_region": ("glm-cn", {"glm-cn", "glm"}),
+    "auto_screen_time": ("15:30", None),   # 每交易日自动筛选 HH:MM；"off" 关闭
     "glm_model": ("glm-5.2", None),
     "quick_model": (None, None),
     "deep_model": (None, None),
@@ -168,6 +169,12 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
     )
     if start_spot:
         spot_cache.start()
+
+    from .scheduler import ScreeningScheduler
+
+    scheduler = ScreeningScheduler(db)
+    if start_spot:
+        scheduler.start()
     app = FastAPI(title="TradingAgents Dashboard", version="0.1.0")
     app.state.db = db
     app.state.queue = queue
@@ -415,12 +422,20 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
     @app.put("/api/settings")
     async def settings_put(request: Request):
         body = await request.json()
+        import re as _re
+
         for key, value in body.items():
             if key not in _SETTING_KEYS:
                 raise HTTPException(422, f"unknown setting '{key}'")
             allowed = _SETTING_KEYS[key][1]
             if allowed is not None and value is not None and value not in allowed:
                 raise HTTPException(422, f"invalid value for {key}: {value}")
+            if (
+                key == "auto_screen_time"
+                and value not in (None, "", "off")
+                and not _re.fullmatch(r"\d{1,2}:\d{2}", str(value))
+            ):
+                raise HTTPException(422, "auto_screen_time 需为 HH:MM 或 off")
             if value is not None and value != "":
                 db.set_setting(key, str(value))
         return settings_get()
