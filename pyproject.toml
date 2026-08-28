@@ -44,15 +44,27 @@ dev = [
 bedrock = [
     "langchain-aws>=1.5.0",
 ]
+# China A-share market data via AKShare (EastMoney/THS endpoints). Optional:
+# pip install "tradingagents[akshare]". No API key required.
+akshare = [
+    "akshare>=1.16.0",
+]
+# Local web dashboard (FastAPI + SSE frontend): pip install ".[dashboard]"
+dashboard = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
 
 [project.scripts]
 tradingagents = "cli.main:app"
+tradingagents-dashboard = "server.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*"]
+include = ["tradingagents*", "cli*", "server*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]
+server = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

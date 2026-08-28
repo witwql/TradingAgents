@@ -176,8 +176,30 @@ TradingAgents works with any market Yahoo Finance covers, using the exchange-suf
 - US: `AAPL`, `SPY`
 - Hong Kong: `0700.HK` · Tokyo: `7203.T` · London: `AZN.L`
 - India: `RELIANCE.NS`, `.BO` · Canada: `.TO` · Australia: `.AX`
-- China A-shares: Shanghai `.SS`, Shenzhen `.SZ` (e.g. `600519.SS` for Kweichow Moutai)
+- China A-shares: Shanghai `.SS`, Shenzhen `.SZ` (e.g. `600519.SS` for Kweichow Moutai). Bare codes auto-resolve: `600519` → `.SS`, `000001` → `.SZ`.
 - Crypto: `BTC-USD`, `ETH-USD`
+
+#### China A-share data via AKShare (recommended)
+
+For A-share analysis, switch the market data categories to the `akshare` vendor (free EastMoney/THS endpoints, no API key):
+
+```bash
+pip install ".[akshare]"
+```
+
+```python
+config = DEFAULT_CONFIG.copy()
+config["data_vendors"] = {
+    "core_stock_apis": "akshare",       # qfq daily OHLCV
+    "technical_indicators": "akshare",
+    "fundamental_data": "akshare",      # valuation + reported statements
+    "news_data": "akshare",             # per-stock + macro flash news
+}
+ta = TradingAgentsGraph(config=config)
+_, decision = ta.propagate("600519.SS", "2026-08-27")
+```
+
+With this preset, prices, indicators, the verified market snapshot, fundamentals/statements, insider-style shareholder changes, and news all come from Chinese-market sources with the same look-ahead protection as the other vendors. Company identity resolution and reflection benchmarks still use Yahoo (`600519.SS` vs the SSE Composite).
 
 <p align="center">
   <img src="assets/cli/cli_init.png" width="100%" style="display: inline-block; margin: 0 2%;">
