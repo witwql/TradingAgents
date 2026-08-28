@@ -1,0 +1,309 @@
+"""SQLite persistence for the dashboard: tasks, workflow stages, events,
+favorites and settings. Single writer-thread friendly (WAL mode) with a coarse
+lock so FastAPI request handlers and queue workers share it safely.
+"""
+
+import json
+import os
+import sqlite3
+import threading
+import time
+import uuid
+from pathlib import Path
+
+_DEFAULT_HOME = Path(os.environ.get("TRADINGAGENTS_DASHBOARD_HOME", "")) if os.environ.get(
+    "TRADINGAGENTS_DASHBOARD_HOME"
+) else Path.home() / ".tradingagents" / "dashboard"
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    ticker TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    asset_type TEXT NOT NULL DEFAULT 'stock',
+    analysts TEXT NOT NULL,
+    debate_rounds INTEGER NOT NULL DEFAULT 1,
+    risk_rounds INTEGER NOT NULL DEFAULT 1,
+    output_language TEXT NOT NULL DEFAULT 'Chinese',
+    status TEXT NOT NULL DEFAULT 'pending',
+    current_stage TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    rating TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    report_dir TEXT NOT NULL DEFAULT '',
+    started_at REAL,
+    finished_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE TABLE IF NOT EXISTS task_stages (
+    task_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    started_at REAL,
+    finished_at REAL,
+    PRIMARY KEY (task_id, name)
+);
+CREATE TABLE IF NOT EXISTS task_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    type TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id);
+CREATE TABLE IF NOT EXISTS favorites (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    added_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS screen_runs (
+    id TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    finished_at REAL,
+    status TEXT NOT NULL DEFAULT 'running',
+    trade_date TEXT NOT NULL DEFAULT '',
+    universe INTEGER NOT NULL DEFAULT 0,
+    results TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT ''
+);
+"""
+
+
+class Database:
+    """Thin thread-safe wrapper over a single SQLite connection."""
+
+    def __init__(self, path: str | Path | None = None):
+        if path is None:
+            _DEFAULT_HOME.mkdir(parents=True, exist_ok=True)
+            path = _DEFAULT_HOME / "dashboard.db"
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.executescript(_SCHEMA)
+            self._migrate()
+            self._conn.commit()
+
+    def _migrate(self):
+        """Additive column migrations for tables created by older builds."""
+        for table, column, decl in (
+            ("screen_runs", "stage", "TEXT NOT NULL DEFAULT ''"),
+            ("screen_runs", "processed", "INTEGER NOT NULL DEFAULT 0"),
+            ("screen_runs", "total", "INTEGER NOT NULL DEFAULT 0"),
+            ("screen_runs", "qualifying", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+    # -- generic helpers ---------------------------------------------------
+    def execute(self, sql: str, params: tuple = ()) -> None:
+        with self._lock:
+            self._conn.execute(sql, params)
+            self._conn.commit()
+
+    def fetchall(self, sql: str, params: tuple = ()) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def fetchone(self, sql: str, params: tuple = ()) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return dict(row) if row else None
+
+    # -- tasks ---------------------------------------------------------------
+    def create_task(self, spec: dict) -> str:
+        task_id = uuid.uuid4().hex[:12]
+        now = time.time()
+        self.execute(
+            "INSERT INTO tasks (id, created_at, ticker, trade_date, asset_type, analysts,"
+            " debate_rounds, risk_rounds, output_language)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                task_id,
+                now,
+                spec["ticker"],
+                spec["trade_date"],
+                spec.get("asset_type", "stock"),
+                json.dumps(spec.get("analysts", ["market", "social", "news", "fundamentals", "macro"])),
+                int(spec.get("debate_rounds", 1)),
+                int(spec.get("risk_rounds", 1)),
+                spec.get("output_language", "Chinese"),
+            ),
+        )
+        return task_id
+
+    def get_task(self, task_id: str) -> dict | None:
+        row = self.fetchone("SELECT * FROM tasks WHERE id=?", (task_id,))
+        if row:
+            row["analysts"] = json.loads(row["analysts"])
+        return row
+
+    def list_tasks(self, limit: int = 100, status: str | None = None) -> list[dict]:
+        if status:
+            rows = self.fetchall(
+                "SELECT * FROM tasks WHERE status=? ORDER BY created_at DESC LIMIT ?",
+                (status, limit),
+            )
+        else:
+            rows = self.fetchall(
+                "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)
+            )
+        for row in rows:
+            row["analysts"] = json.loads(row["analysts"])
+        return rows
+
+    def update_task(self, task_id: str, **fields) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.execute(f"UPDATE tasks SET {cols} WHERE id=?", (*fields.values(), task_id))
+
+    def cancel_if_pending(self, task_id: str) -> bool:
+        """Atomically cancel ONLY while still pending.
+
+        The claim-then-check pattern in TaskQueue.cancel raced with a worker
+        claiming between the check and the write, letting a cancelled status
+        overwrite a running/completed task. The WHERE guard makes the state
+        transition atomic.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE tasks SET status='cancelled', finished_at=?"
+                " WHERE id=? AND status='pending'",
+                (time.time(), task_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def claim_next_pending(self) -> dict | None:
+        """Atomically claim the oldest pending task (FIFO)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM tasks WHERE status='pending' ORDER BY created_at LIMIT 1"
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            task = dict(row)
+            task["analysts"] = json.loads(task["analysts"])
+            self._conn.execute(
+                "UPDATE tasks SET status='running', started_at=? WHERE id=? AND status='pending'",
+                (time.time(), task["id"]),
+            )
+            self._conn.commit()
+        refreshed = self.get_task(task["id"])
+        return refreshed if refreshed and refreshed["status"] == "running" else None
+
+    def prune_events(self, keep_tasks: int = 50) -> int:
+        """Delete task_events of tasks beyond the most recent ``keep_tasks``.
+
+        Every analysis emits 100-200 stream events; without retention the
+        table grows unboundedly across months of use.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM task_events WHERE task_id NOT IN ("
+                " SELECT id FROM tasks ORDER BY created_at DESC LIMIT ?)",
+                (keep_tasks,),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    def delete_task(self, task_id: str) -> None:
+        self.execute("DELETE FROM task_stages WHERE task_id=?", (task_id,))
+        self.execute("DELETE FROM task_events WHERE task_id=?", (task_id,))
+        self.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    # -- stages / events -----------------------------------------------------
+    def set_stages(self, task_id: str, names: list[str]) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM task_stages WHERE task_id=?", (task_id,))
+            for seq, name in enumerate(names):
+                self._conn.execute(
+                    "INSERT INTO task_stages (task_id, seq, name) VALUES (?,?,?)",
+                    (task_id, seq, name),
+                )
+            self._conn.commit()
+
+    def update_stage(self, task_id: str, name: str, status: str) -> None:
+        ts = time.time()
+        col = "started_at" if status == "running" else "finished_at"
+        self.execute(
+            f"UPDATE task_stages SET status=?, {col}=? WHERE task_id=? AND name=?",
+            (status, ts, task_id, name),
+        )
+
+    def get_stages(self, task_id: str) -> list[dict]:
+        return self.fetchall(
+            "SELECT name, seq, status, started_at, finished_at FROM task_stages"
+            " WHERE task_id=? ORDER BY seq",
+            (task_id,),
+        )
+
+    def append_event(self, task_id: str, type_: str, payload: dict) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO task_events (task_id, ts, type, payload) VALUES (?,?,?,?)",
+                (task_id, time.time(), type_, json.dumps(payload, ensure_ascii=False)),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def events_since(self, task_id: str, last_id: int) -> list[dict]:
+        rows = self.fetchall(
+            "SELECT id, ts, type, payload FROM task_events WHERE task_id=? AND id>?"
+            " ORDER BY id",
+            (task_id, last_id),
+        )
+        for r in rows:
+            r["payload"] = json.loads(r["payload"])
+        return rows
+
+    # -- favorites -----------------------------------------------------------
+    def list_favorites(self) -> list[dict]:
+        return self.fetchall("SELECT * FROM favorites ORDER BY added_at")
+
+    def add_favorite(self, code: str, name: str = "") -> None:
+        self.execute(
+            "INSERT OR REPLACE INTO favorites (code, name, added_at) VALUES (?,?,?)",
+            (code, name, time.time()),
+        )
+
+    def remove_favorite(self, code: str) -> None:
+        self.execute("DELETE FROM favorites WHERE code=?", (code,))
+
+    # -- settings --------------------------------------------------------------
+    def path(self) -> str:
+        """Actual SQLite file backing this connection (diagnostics)."""
+        row = self._conn.execute("PRAGMA database_list").fetchone()
+        return row[2] if row else ""
+
+    def get_settings(self) -> dict[str, str]:
+        return {r["key"]: r["value"] for r in self.fetchall("SELECT key, value FROM settings")}
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value)
+        )
+
+
+def default_db_path() -> str:
+    """Canonical dashboard DB location (also used for UI diagnostics)."""
+    _DEFAULT_HOME.mkdir(parents=True, exist_ok=True)
+    return str(_DEFAULT_HOME / "dashboard.db")
+
+
+def resolve_ticker(code: str) -> str:
+    """Normalize user-entered codes to the framework's canonical symbol."""
+    from tradingagents.dataflows.symbol_utils import normalize_symbol
+
+    return normalize_symbol(code.strip())

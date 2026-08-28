@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>TradingAgents Dashboard - 多智能体股票分析</title>
+<link rel="stylesheet" href="/static/style.css?v=20260827e"/>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo">◈</span> TradingAgents <span class="sub">Dashboard</span></div>
+  <nav id="nav"></nav>
+  <div class="top-right">
+    <span id="llm-badge" class="chip">GLM-5.2</span>
+    <span id="key-badge" class="chip warn" title="API Key 状态">Key ?</span>
+  </div>
+</header>
+
+<div id="active-strip" class="active-strip hidden"></div>
+
+<main id="app">
+  <!-- ============ 工作台 ============ -->
+  <section data-view="dashboard" class="view">
+    <h2>工作台</h2>
+    <div class="stat-grid" id="stats"></div>
+    <div class="card">
+      <div class="card-head">
+        <h3>最近分析</h3>
+        <button class="btn ghost" onclick="location.hash='#tasks'">全部任务 →</button>
+      </div>
+      <table class="tbl" id="recent-tasks"></table>
+    </div>
+    <div class="card">
+      <h3>工作流说明</h3>
+      <p class="muted">每位标的由一组 LLM 智能体协作完成：分析师团队并行产出市场 / 情绪 / 新闻 / 基本面四份报告 →
+      多空研究员辩论 N 轮 → 研究主管裁决 → 交易员形成计划 → 激进 / 保守 / 中立三方风险辩论 →
+      组合经理给出五档评级终审。进度可在任务队列实时观看。</p>
+      <div class="pipeline-preview" id="pipeline-preview"></div>
+    </div>
+  </section>
+
+  <!-- ============ 新建分析 ============ -->
+  <section data-view="new" class="view">
+    <h2>新建分析</h2>
+    <form id="new-form" class="card form">
+      <label>股票 / ETF 代码
+        <textarea id="f-tickers" rows="2" placeholder="600519, 000001.SZ, 510300 —— 支持逗号或空格批量输入" required></textarea>
+      </label>
+      <div class="row">
+        <label>分析日期 <input type="date" id="f-date"/></label>
+        <label>辩论轮次
+          <select id="f-debate"><option value="1">1 轮（快）</option><option value="2">2 轮</option><option value="3">3 轮（深）</option></select>
+        </label>
+        <label>风险讨论轮次
+          <select id="f-risk"><option value="1">1 轮（快）</option><option value="2">2 轮</option><option value="3">3 轮（深）</option></select>
+        </label>
+        <label>输出语言
+          <select id="f-lang"><option>Chinese</option><option>English</option></select>
+        </label>
+      </div>
+      <fieldset>
+        <legend>分析师团队</legend>
+        <span id="f-analysts"></span>
+      </fieldset>
+      <button class="btn primary" type="submit">提交分析任务</button>
+      <span id="new-msg" class="muted"></span>
+    </form>
+  </section>
+
+  <!-- ============ 任务队列 ============ -->
+  <section data-view="tasks" class="view">
+    <div class="tasks-head">
+      <h2>任务队列</h2>
+      <div class="seg" id="task-filters">
+        <button class="seg-btn active" data-status="">全部<i>0</i></button>
+        <button class="seg-btn" data-status="running">运行中<i>0</i></button>
+        <button class="seg-btn" data-status="pending">排队中<i>0</i></button>
+        <button class="seg-btn" data-status="completed">已完成<i>0</i></button>
+        <button class="seg-btn" data-status="failed">失败<i>0</i></button>
+      </div>
+    </div>
+    <div id="task-cards" class="task-list"></div>
+  </section>
+
+  <!-- ============ 明日精选 ============ -->
+  <section data-view="picks" class="view">
+    <div class="tasks-head">
+      <h2>明日精选 <span class="muted" style="font-size:13px;font-weight:400">主板 · 多因子共振 · P(次日上涨)≥80%</span></h2>
+      <button class="btn primary" id="screen-run" onclick="startScreening()">▶ 运行筛选</button>
+    </div>
+
+    <div id="screen-status" class="screen-status hidden">
+      <div class="ss-row">
+        <span class="spinner"></span>
+        <span id="ss-stage" class="ss-stage">准备中…</span>
+        <span id="ss-count" class="ss-count"></span>
+        <span id="ss-elapsed" class="ss-elapsed muted"></span>
+      </div>
+      <div class="mini-bar" style="max-width:none;margin-top:10px"><i id="ss-bar" style="width:0%"></i></div>
+      <div id="ss-hint" class="muted" style="font-size:11.5px;margin-top:6px"></div>
+    </div>
+
+    <div id="screen-meta" class="muted" style="font-size:12.5px;margin:14px 0 12px">尚未运行过筛选</div>
+    <div id="picks-list" class="task-list"></div>
+    <div id="screen-history" class="screen-history"></div>
+    <div class="card" style="margin-top:16px">
+      <h3>⚠️ 模型性质与使用须知</h3>
+      <p class="muted" style="font-size:12.5px">
+        概率为<b>个股自身历史条件频率</b>的加权估计（窗口≈500个交易日），每个因子附样本数；≥80%
+        是硬过滤阈值，多数交易日会少于 5 只甚至为 0 —— 这是模型的诚实行为。共振日历史命中率
+        仅作校准参考。股票池限定沪深主板（600/601/603/605/000/001/002/003，剔除ST/退市），
+        普通账户均可交易。历史频率不代表未来表现，本工具用于学习研究，不构成投资建议。
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ 报告中心 ============ -->
+  <section data-view="reports" class="view">
+    <h2>报告中心</h2>
+    <div class="split card">
+      <aside>
+        <label class="muted">选择已完成的分析</label>
+        <select id="report-task" size="12"></select>
+      </aside>
+      <article>
+        <div class="report-head">
+          <span id="report-title" class="muted">← 在左侧选择一份报告文件</span>
+          <a id="open-raw" class="btn ghost small hidden" target="_blank">原始 MD</a>
+        </div>
+        <div id="report-body" class="md"></div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ============ 自选股 ============ -->
+  <section data-view="favorites" class="view">
+    <h2>自选股</h2>
+    <form id="fav-form" class="inline-form">
+      <input id="fav-code" placeholder="代码，如 600519 或 510300" required/>
+      <input id="fav-name" placeholder="备注名（可选）"/>
+      <button class="btn primary" type="submit">添加</button>
+    </form>
+    <table class="tbl clickable" id="fav-table"></table>
+  </section>
+
+  <!-- ============ 设置 ============ -->
+  <section data-view="settings" class="view">
+    <h2>设置</h2>
+    <form id="settings-form" class="card form">
+      <label>GLM 接入区域
+        <select id="s-region">
+          <option value="glm-cn">BigModel 中国区（ZHIPU_CN_API_KEY · open.bigmodel.cn）</option>
+          <option value="glm">Z.AI 国际站（ZHIPU_API_KEY · api.z.ai）</option>
+        </select>
+      </label>
+      <div class="row">
+        <label>模型（深度思考）<input id="s-deep" placeholder="glm-5.2"/></label>
+        <label>模型（快速思考）<input id="s-quick" placeholder="留空则与上方一致"/></label>
+        <label>Temperature<input id="s-temp" placeholder="留空用供应商默认"/></label>
+      </div>
+      <button class="btn primary" type="submit">保存设置</button>
+      <span id="settings-msg" class="muted"></span>
+    </form>
+    <div class="card">
+      <h3>API Key 状态</h3>
+      <p id="key-state" class="muted">检查中…</p>
+      <pre class="hint"># 项目根目录创建 .env 文件写入（二选一）：
+ZHIPU_CN_API_KEY=你的密钥     # 中国区 BigModel
+ZHIPU_API_KEY=你的密钥       # 国际站 Z.AI
+
+然后重启 Dashboard 服务生效。</pre>
+    </div>
+  </section>
+</main>
+
+<!-- 任务详情抽屉 -->
+<div id="drawer-mask" class="hidden"></div>
+<aside id="drawer" class="hidden">
+  <header>
+    <strong id="drawer-title">任务</strong>
+    <button class="btn ghost small" onclick="closeDrawer()">✕ 关闭</button>
+  </header>
+  <div id="drawer-body"></div>
+</aside>
+
+<footer class="foot muted">
+  学习研究用途 · 输出为 AI 生成的分析报告，不构成任何投资建议 · 数据来源：东方财富/AKShare
+</footer>
+
+<script src="/static/app.js?v=20260827f"></script>
+</body>
+</html>
