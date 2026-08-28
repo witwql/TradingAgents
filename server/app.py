@@ -203,7 +203,12 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
     @app.get("/")
     @app.get("/dashboard")
     def index():
-        return HTMLResponse((_STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+        # HTML 入口必须禁缓存：前端靠 ?v= 版本号刷新资源，若 HTML 本身被
+        # 浏览器缓存，用户会永远停在旧版页面（复盘事故的根因之一）。
+        return HTMLResponse(
+            (_STATIC_DIR / "index.html").read_text(encoding="utf-8"),
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
 
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 

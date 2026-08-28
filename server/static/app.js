@@ -246,7 +246,23 @@ function renderDrawer(detail) {
     </div>
     <h3 style="margin:10px 0 4px">智能体工作流</h3>
     <div id="wf-stages">${stages.map(stageRow).join("")}</div>
+    <div class="feed-head">
+      <h3>实时输出流 <span class="muted" id="feed-count"></span></h3>
+      <span class="feed-tools">
+        <select id="feed-filter">
+          <option value="">全部</option>
+          <option value="llm">思考/结果</option>
+          <option value="tool">工具调用</option>
+          <option value="err">错误</option>
+        </select>
+        <button class="btn small" id="feed-scroll-btn" onclick="toggleFeedScroll()">⬇ 自动滚动：开</button>
+      </span>
+    </div>
+    <div id="agent-feed"></div>
     <div id="drawer-result"></div>`;
+  state.feedCount = 0;
+  $("#feed-filter").value = "";
+  $("#feed-filter").onchange = () => applyFeedFilter();
   fillResult(detail);
 }
 function stageRow(s) {
@@ -385,297 +401,211 @@ function toggleFeedScroll() {
 }
 
 /* ---------------- 明日精选 ---------------- */
-function loadPicks() { pollScreening(false); }
+const screenPoll = { timer: null, fails: 0 };
+let screenPrevStatus = null;
+
+function loadPicks() {
+  clearTimeout(screenPoll.timer);
+  screenPoll.fails = 0;
+  pollScreening();
+}
 
 async function deepResearch(code) {
+  if (deepResearch._pending) return;               // 防连点
+  deepResearch._pending = code;
   try {
     const { task_ids } = await api("/tasks", {
       method: "POST",
       body: { tickers: [code], output_language: "Chinese" },
     });
-    showToast("深度研究已排队", `${code} · 全分析师团队 · 打开任务面板查看进度`);
+    showToast("深度研究已排队", `${code} · 全分析师团队`);
     go("#tasks");
     openDrawer(task_ids[0]);
   } catch (e) {
     showToast("排队失败", e.message, true);
-  }
+  } finally { deepResearch._pending = null; }
+}
+
+function setRunButton(mode, extra = "") {
+  const btn = $("#screen-run");
+  if (mode === "running") { btn.disabled = true; btn.textContent = `筛选中… ${extra}`; }
+  else if (mode === "starting") { btn.disabled = true; btn.textContent = "启动中…"; }
+  else { btn.disabled = false; btn.textContent = "▶ 运行筛选"; }
 }
 
 async function startScreening() {
-  const btn = $("#screen-run");
-  btn.disabled = true; btn.textContent = "筛选中…(约1-3分钟)";
+  setRunButton("starting");
   try {
-    await api("/screen", { method: "POST" });
-    pollScreening(true);
+    const resp = await api("/screen", { method: "POST" });
+    showToast(
+      resp.already_running ? "已有一轮筛选在运行，直接展示进度" : "筛选已启动",
+      resp.already_running ? "轮询实时进度中" : "股票池拉取 → 逐股评估 → 概率合成",
+    );
+    screenPrevStatus = null;
+    screenPoll.fails = 0;
+    pollScreening();
   } catch (e) {
-    btn.disabled = false; btn.textContent = "▶ 运行筛选";
-    $("#screen-meta").textContent = `启动失败：${e.message}`;
+    setRunButton("idle");
+    showToast("启动失败", e.message, true);
   }
 }
 
-let screeningTimer = null;
-async function pollScreening(active) {
-  const data = await api("/screen/latest").catch(() => null);
-  if (!data || !data.run) {
-    if (!active) $("#screen-meta").textContent = "尚未运行过筛选";
+async function cancelScreening() {
+  const r = state.lastScreenRun;
+  if (!r || r.status !== "running") return;
+  try {
+    await api("/screen/cancel", { method: "POST", body: { run_id: r.id } });
+    showToast("已请求停止", "完成当前个股后即终止，已评估数据保留");
+    $("#ss-stop").disabled = true;
+  } catch (e) {
+    showToast("停止失败", e.message, true);
+  }
+}
+
+const STAGE_HINTS = {
+  universe: { text: "拉取主板股票池（新浪全市场快照）", hint: "此阶段约需 15-20 秒，无逐只进度" },
+  analyzing: { text: "逐股评估（拉历史 → 5+1因子 → 概率合成）", hint: "历史数据已缓存时会快很多" },
+};
+
+async function pollScreening() {
+  clearTimeout(screenPoll.timer);
+  let r = null;
+  try {
+    const data = await api("/screen/latest");
+    r = data.run;
+    screenPoll.fails = 0;
+  } catch (e) {
+    screenPoll.fails++;
+  }
+
+  if (r === null) {
+    // 轮询失败：有界退避重试，绝不死锁按钮
+    if (screenPoll.watching || screenPoll.fails <= 3) {
+      $("#screen-meta").innerHTML =
+        `<span style="color:var(--amber)">连接波动，${3 * screenPoll.fails}s 后自动重试（第 ${screenPoll.fails} 次）…</span>`;
+      screenPoll.timer = setTimeout(pollScreening, 3000 * screenPoll.fails);
+    } else {
+      setRunButton("idle");
+      $("#screen-status").classList.add("hidden");
+      $("#screen-meta").innerHTML =
+        `<span style="color:var(--red)">与服务的连接失败，请确认服务仍在运行后刷新本页。</span>`;
+    }
     return;
   }
-  const r = data.run;
+
+  state.lastScreenRun = r;
+  renderScreenStatus(r);
+
   if (r.status === "running") {
-    $("#screen-meta").textContent = `筛选运行中…（股票池约 ${r.universe || "…"} 只，后台拉取历史+计算因子）`;
-    clearTimeout(screeningTimer);
-    screeningTimer = setTimeout(() => pollScreening(true), 5000);
+    screenPoll.watching = true;
+    setRunButton("running", `${r.processed ?? 0}/${r.total ?? "?"}`);
+    screenPoll.timer = setTimeout(pollScreening, 2000);
     return;
   }
-  const btn = $("#screen-run");
-  btn.disabled = false; btn.textContent = "▶ 运行筛选";
+
+  // ── 终态 ──
+  screenPoll.watching = false;
+  setRunButton("idle");
+  $("#screen-status").classList.add("hidden");
+  renderScreenHistory();
+
+  const sawRunning = screenPrevStatus === "running";
   if (r.status === "failed") {
-    $("#screen-meta").innerHTML = `运行失败：<span style="color:var(--red)">${esc(r.error || "")}</span>`;
+    $("#screen-meta").innerHTML =
+      `运行失败：<span style="color:var(--red)">${esc((r.error || "").slice(0, 160))}</span> · ${fmtTime(r.created_at)}`;
+    $("#picks-list").innerHTML = "";
+    if (sawRunning) showToast("筛选失败", (r.error || "").slice(0, 80), true);
+    screenPrevStatus = r.status;
     return;
   }
-  const达标 = r.qualifying > 0;
+  if (r.status === "cancelled") {
+    $("#screen-meta").textContent =
+      `已停止 · 中止前评估 ${r.evaluated ?? r.processed ?? 0} 只 · ${fmtTime(r.created_at)}`;
+    const wl = r.watchlist || [];
+    $("#picks-list").innerHTML =
+      `<div class="task-empty">筛选已停止（已评估个股的结果已缓存，重新运行会快很多）。</div>` +
+      (wl.length ? `<h3 style="margin:12px 0 8px">👁 中止前观察名单</h3>` +
+        wl.map((p, i) => pickCard(p, i, true)).join("") : "");
+    if (sawRunning) showToast("筛选已停止", "已评估数据保留在缓存中");
+    screenPrevStatus = r.status;
+    return;
+  }
+
+  const picks = r.picks || [], watchlist = r.watchlist || [];
   $("#screen-meta").textContent =
-    `运行于 ${fmtTime(r.created_at)} · 评估 ${r.evaluated} 只 · 达标(≥80%) ${r.qualifying} 只`;
+    `最近完成 ${fmtTime(r.created_at)} · 股票池 ${r.universe ?? "?"} · 评估 ${r.evaluated ?? "?"} 只 · 达标(≥80%) ${r.qualifying ?? 0} 只`;
   let html = "";
-  if (达标) {
-    html += `<h3 style="margin:4px 0 10px">✅ 达标精选</h3>`;
-    html += r.picks.map((p, i) => pickCard(p, i)).join("");
+  if ((r.qualifying ?? 0) > 0) {
+    html += `<h3 style="margin:4px 0 10px">✅ 达标精选（P≥80%）</h3>` +
+      picks.map((p, i) => pickCard(p, i)).join("");
   } else {
-    html += `<div class="task-empty">今日无标的达到 80% 概率阈值 —— 空仓等待也是模型的建议。<br/>以下为概率最高的观察名单（未达标）</div>`;
+    html += `<div class="task-empty">今日无标的达到 80% 概率阈值 —— 空仓等待也是模型的建议。以下观察名单仅跟踪参考。</div>`;
   }
-  html += `<h3 style="margin:16px 0 10px">👁 观察名单 Top5（未达 80%，仅跟踪参考）</h3>`;
-  html += (r.watchlist || []).map((p, i) => pickCard(p, i, true)).join("")
-    || `<div class="muted">无</div>`;
+  html += `<h3 style="margin:16px 0 10px">👁 观察名单 Top5（未达 80%）</h3>` +
+    (watchlist.map((p, i) => pickCard(p, i, true)).join("") || `<div class="muted">无</div>`);
   $("#picks-list").innerHTML = html;
-}
 
-function pickCard(p, idx, muted = false) {
-  const chips = (p.contributions || [])
-    .filter((c) => c.fired)
-    .map((c) => c.used
-      ? `<span class="factor-chip">${esc(c.factor)} <b>+${((c.p - 0.5) * 100).toFixed(0)}pp</b> <span class="n">n=${c.n}</span></span>`
-      : `<span class="factor-chip" style="opacity:.55">${esc(c.factor)} <span class="n">样本不足</span></span>`)
-    .join("");
-  const calib = p.resonance_hit_rate != null
-    ? `共振日历史命中率 <b style="color:var(--text)">${(p.resonance_hit_rate * 100).toFixed(1)}%</b>（${p.resonance_samples} 个样本）`
-    : `共振日历史样本不足（${p.resonance_samples}），无校准数据`;
-  const pct = Math.round(p.probability * 100);
-  const probColor = pct >= 80 ? "var(--green)" : "var(--amber)";
-  return `<div class="pick-card"${muted ? ' style="opacity:.82"' : ""}>
-    <div class="pick-head">
-      <div class="pick-rank">${idx + 1}</div>
-      <span class="pick-ticker">${esc(p.code)}</span>
-      <span>${esc(p.name)}</span>
-      <span class="pick-price">¥${(p.close ?? 0).toFixed(2)}</span>
-      <span class="muted" style="font-size:12px">命中因子 ${p.factors_fired}/5</span>
-      <div class="pick-prob">
-        <div class="num" style="color:${probColor}">${pct}%</div>
-        <div class="lbl">P(次日上涨)</div>
-      </div>
-      <button class="btn small primary" onclick="event.stopPropagation();deepResearch('${p.code}')">🔬 深度研究</button>
-    </div>
-    <div class="prob-bar"><i style="width:${pct}%"></i></div>
-    <div class="factor-chips">${chips}</div>
-    <div class="calib">📏 ${calib} · 统计窗口 ${p.history_days} 交易日</div>
-  </div>`;
-}
-
-function closeDrawer(reload = true) {
-  if (state.drawerES) { state.drawerES.close(); state.drawerES = null; }
-  $("#drawer-mask").classList.add("hidden");
-  $("#drawer").classList.remove("open");
-  state.drawerTaskId = null;
-  if (reload) loadView(location.hash.slice(1) || "dashboard");
-}
-
-/* ---------------- reports ---------------- */
-async function loadReports(presetId) {
-  const { tasks } = await api("/tasks?status=completed&limit=50");
-  const sel = $("#report-task");
-  sel.innerHTML = tasks
-    .map((t) => `<option value="${t.id}">${esc(t.ticker)} · ${esc(t.trade_date)} · ${esc(fmtTime(t.created_at))}${presetId === t.id ? " selected" : ""}</option>`)
-    .join("") || `<option disabled>暂无已完成的分析（确认端口=8000 并强刷；完整报告文件始终保留在 ~/.tradingagents/logs/reports/）</option>`;
-  sel.onchange = () => loadReportFiles(sel.value);
-  const first = presetId || tasks[0]?.id;
-  if (first) { sel.value = first; loadReportFiles(first); }
-}
-async function loadReportFiles(id) {
-  if (!id) return;
-  const manifest = await api(`/tasks/${id}/reports`);
-  state.cache.reportManifest = manifest.files;
-  const picker = $("#report-task");
-  // second column: use the aside select's sibling file list injected as another select
-  let files = $("#report-files");
-  if (!files) {
-    files = document.createElement("select");
-    files.id = "report-files";
-    files.size = 14;
-    files.style.marginTop = "10px";
-    picker.after(files);
-    files.onchange = () => showReport(id, files.value);
+  if (sawRunning) {
+    showToast(
+      `筛选完成：达标 ${r.qualifying ?? 0} 只`,
+      (r.qualifying ?? 0) > 0
+        ? `最高概率 ${(Math.max(...picks.map(p => p.probability)) * 100).toFixed(0)}%`
+        : "今日无达标标的，已展示观察名单",
+    );
+    setTimeout(() => $("#picks-list").scrollIntoView({ behavior: "smooth", block: "start" }), 150);
   }
-  files.innerHTML = manifest.files
-    .map((f) => `<option value="${esc(f.path)}">${esc(f.path)}</option>`).join("")
-    || `<option disabled>无报告文件</option>`;
-  const prefer = ["complete_report.md", "5_portfolio/decision.md"].find((p) => manifest.files.some((f) => f.path === p));
-  if (prefer) { files.value = prefer; showReport(id, prefer); }
+  screenPrevStatus = r.status;
 }
-async function showReport(id, path) {
-  const data = await api(`/tasks/${id}/report?path=${encodeURIComponent(path)}`);
-  $("#report-title").textContent = path;
-  const raw = $("#open-raw");
-  raw.classList.remove("hidden");
-  raw.href = "#";
-  raw.onclick = (e) => { e.preventDefault(); download(path, data.content); };
-  $("#report-body").innerHTML = markdown(data.content);
-}
-function download(name, text) {
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([text], { type: "text/markdown" }));
-  a.download = name.split("/").pop();
-  a.click();
-}
-function openReportPicker(id) { route(); }
 
-/* ---------------- favorites ---------------- */
-async function loadFavorites() {
-  const data = await api("/favorites");
-  const { favorites, quote_ts: ts, refresh_seconds: cycle } = data;
-  const ready = data.quotes_ready !== false;  // 旧后端无此字段时视为就绪
-  const note = ready
-    ? (ts ? `行情 ${fmtTime(ts)} 更新` + (cycle ? ` · 每${Math.round(cycle / 60)}分钟自动刷新` : "") : "")
-    : "行情首次加载中…数秒后自动重试";
-  $("#fav-table").innerHTML = `<tr><th>代码</th><th>名称</th><th>最新价</th><th>涨跌幅</th><th></th><th>
-      <span class="muted" style="font-weight:400;font-size:11px">${note}</span></th></tr>` +
-    (favorites.map((f) => `<tr>
-      <td><strong>${esc(f.code)}</strong></td><td>${esc(f.name || f.info?.name || "")}</td>
-      <td>${f.price ?? "—"}</td>
-      <td class="${pctTrend(f.pct)}">${fmtPct(f.pct)}</td>
-      <td><button class="btn small" onclick='quickAnalyze("${f.code}")'>快速分析</button></td>
-      <td><button class="btn danger small" onclick="removeFav('${f.code}')">×</button></td></tr>`).join("")
-      || `<tr><td colspan="6" class="muted">自选股为空。若你之前添加过，请确认地址栏端口（默认 8000）并强制刷新 —— 数据库路径见 <a href="#" onclick="fetch('/api/health').then(h=>h.json()).then(h=>alert('当前数据库：'+h.db_path));return false">/api/health</a></td></tr>`);
-  if (!ready && !loadFavorites._retried) {
-    loadFavorites._retried = true;
-    setTimeout(() => { if (curView() === "favorites") loadFavorites(); }, 4000);
+function renderScreenStatus(r) {
+  const card = $("#screen-status");
+  if (r.status !== "running") { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  const st = STAGE_HINTS[r.stage] || STAGE_HINTS.analyzing;
+  $("#ss-stage").textContent = st.text;
+  $("#ss-hint").textContent = st.hint;
+  const done = r.processed ?? 0, total = r.total ?? 0;
+  $("#ss-count").textContent = total ? `${done}/${total} 只 · 达标 ${r.qualifying ?? 0}` : "";
+  $("#ss-bar-wrap").classList.toggle("indeterminate", !total);
+  $("#ss-bar").style.width = total ? Math.round((done / total) * 100) + "%" : "30%";
+  $("#ss-stop").disabled = false;
+  const started = r.created_at ? (Date.now() - r.created_at * 1000) / 1000 : 0;
+  $("#ss-elapsed").textContent = started
+    ? `已运行 ${Math.floor(started / 60)}分${String(Math.floor(started % 60)).padStart(2, "0")}秒`
+    : "";
+}
+
+async function renderScreenHistory() {
+  const data = await api("/screen/history?limit=8").catch(() => null);
+  const box = $("#screen-history");
+  if (!box) return;
+  const runs = (data && data.runs) || [];
+  if (!runs.length) { box.innerHTML = ""; return; }
+  box.innerHTML = `<h3>历史运行</h3><table class="sh-table">
+    <tr><th>时间</th><th>状态</th><th>股票池</th><th>评估</th><th>达标</th><th>最高概率</th></tr>` +
+    runs.map((h) => `<tr>
+      <td>${fmtTime(h.created_at)}</td>
+      <td><span class="badge ${h.status}">${STATUS_TEXT[h.status] || h.status}</span></td>
+      <td>${h.universe ?? "—"}</td><td>${h.evaluated ?? "—"}</td>
+      <td>${h.qualifying ?? "—"}</td>
+      <td>${h.top_probability != null ? (h.top_probability * 100).toFixed(0) + "%" : "—"}</td>
+    </tr>`).join("") + `</table>`;
+}
+
+function showToast(title, sub = "", isErr = false) {
+  let wrap = $(".toast-wrap");
+  if (!wrap) {
+    wrap = document.createElement("div");
+    wrap.className = "toast-wrap";
+    document.body.appendChild(wrap);
   }
-}
-/* 行情涨跌遵循 A 股配色：涨红跌绿 */
-function pctTrend(pct) { return (pct ?? 0) >= 0 ? "up" : "down"; }
-function fmtPct(pct) {
-  if (pct == null || isNaN(pct)) return "—";
-  const sign = pct >= 0 ? "+" : "";
-  return `${sign}${pct.toFixed(2)}% ${pct >= 0 ? "▲" : "▼"}`;
-}
-async function removeFav(code) { await api(`/favorites/${encodeURIComponent(code)}`, { method: "DELETE" }); loadFavorites(); }
-async function quickAnalyze(code) {
-  const { task_ids } = await api("/tasks", { method: "POST", body: { tickers: [code] } });
-  go("#tasks"); openDrawer(task_ids[0]);
+  const el = document.createElement("div");
+  el.className = "toast" + (isErr ? " err" : "");
+  el.innerHTML = `<div class="t-title">${esc(title)}</div>${sub ? `<div class="t-sub">${esc(sub)}</div>` : ""}`;
+  wrap.appendChild(el);
+  setTimeout(() => el.remove(), 5200);
 }
 
-/* ---------------- settings ---------------- */
-async function loadSettings() {
-  const [settings, health] = await Promise.all([api("/settings"), api("/health")]);
-  $("#s-region").value = settings.glm_region || "glm-cn";
-  $("#s-deep").value = settings.deep_model || settings.glm_model || "glm-5.2";
-  $("#s-quick").value = settings.quick_model || "";
-  $("#s-temp").value = settings.temperature || "";
-  $("#s-autoscreen").value = settings.auto_screen_time || "15:30";
-  const hasKey = settings.glm_region === "glm" ? health.has_zhipu_intl_key : health.has_zhipu_cn_key;
-  $("#key-state").textContent = hasKey
-    ? `✅ 已检测到 API Key（区域：${settings.glm_region === "glm" ? "Z.AI 国际站" : "BigModel 中国区"}），可以直接提交分析。`
-    : `⚠️ 尚未检测到 API Key —— 提交任务会失败。按下方指引配置 .env 后重启服务。`;
-  const badge = $("#key-badge");
-  badge.textContent = hasKey ? "Key ✓" : "Key ✗";
-  badge.className = `chip ${hasKey ? "ok" : "warn"}`;
-  return { settings };
-}
-async function saveSettings(ev) {
-  ev.preventDefault();
-  const body = {};
-  const deep = $("#s-deep").value.trim(), quick = $("#s-quick").value.trim(),
-    temp = $("#s-temp").value.trim();
-  body.glm_region = $("#s-region").value;
-  body.deep_model = deep; body.glm_model = deep;
-  if (quick) body.quick_model = quick;
-  if (temp && !isNaN(+temp)) body.temperature = temp;
-  const autoscreen = $("#s-autoscreen").value.trim();
-  body.auto_screen_time = autoscreen || "off";
-  try {
-    await api("/settings", { method: "PUT", body });
-    $("#settings-msg").textContent = "已保存 ✓";
-    loadHealthBadge();
-  } catch (e) { $("#settings-msg").textContent = `保存失败：${e.message}`; }
-}
-async function loadHealthBadge() {
-  try {
-    const h = await api("/health");
-    const settings = await api("/settings");
-    const hasKey = settings.glm_region === "glm" ? h.has_zhipu_intl_key : h.has_zhipu_cn_key;
-    $("#llm-badge").textContent = (settings.deep_model || settings.glm_model || "GLM-5.2").toUpperCase();
-    const badge = $("#key-badge");
-    badge.textContent = hasKey ? "Key ✓" : "Key ✗";
-    badge.className = `chip ${hasKey ? "ok" : "warn"}`;
-  } catch (_) {}
-}
-
-/* ---------------- tiny markdown renderer ---------------- */
-function markdown(src) {
-  const lines = esc(src).replace(/\r/g, "").split("\n");
-  let html = "", inCode = false, listMode = "", tableBuf = [];
-  const flushTable = () => {
-    if (!tableBuf.length) return;
-    html += "<table>" + tableBuf.map((cells, i) =>
-      "<tr>" + cells.map((c) => `<${i === 0 ? "th" : "td"}>${inline(c)}</${i === 0 ? "th" : "td"}>`).join("") + "</tr>").join("") + "</table>";
-    tableBuf = [];
-  };
-  const inline = (t) => t
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
-    .replace(/(^|\W)\*([^*\n]+)\*(?=\W|$)/g, "$1<i>$2</i>")
-    .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (/^```/.test(line)) { flushTable(); html += inCode ? "</pre>" : "<pre>"; inCode = !inCode; continue; }
-    if (inCode) { html += line + "\n"; continue; }
-    if (/^\|(.+)\|$/.test(line.trim())) {
-      const cells = line.trim().slice(1, -1).split("|").map((c) => c.trim());
-      if (cells.every((c) => /^:?-{2,}:?$/.test(c))) continue;
-      tableBuf.push(cells); continue;
-    } else flushTable();
-    let m;
-    if ((m = line.match(/^(#{1,4})\s+(.*)/))) { const l = m[1].length; html += `<h${l}>${inline(m[2])}</h${l}>`; }
-    else if (/^(---+|\*\*\*+)$/.test(line.trim())) html += "<hr/>";
-    else if ((m = line.match(/^\s*[-*]\s+(.*)/))) {
-      if (listMode !== "ul") { html += "<ul>"; listMode = "ul"; } html += `<li>${inline(m[1])}</li>`;
-    } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)/))) {
-      if (listMode !== "ol") { html += "<ol>"; listMode = "ol"; } html += `<li>${inline(m[1])}</li>`;
-    } else if ((m = line.match(/^>\s?(.*)/))) html += `<blockquote>${inline(m[1])}</blockquote>`;
-    else if (!line.trim()) { if (listMode) { html += `</${listMode}>`; listMode = ""; } }
-    else { if (listMode) { html += `</${listMode}>`; listMode = ""; } html += `<p>${inline(line)}</p>`; }
-  }
-  flushTable();
-  if (listMode) html += `</${listMode}>`;
-  if (inCode) html += "</pre>";
-  return html;
-}
-
-/* ---------------- plumbing ---------------- */
-function fmtTime(ts) {
-  const d = new Date(ts * 1000);
-  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-}
-function loadView(name) {
-  try {
-    ({ dashboard: loadDashboard, new: buildAnalystPicker, tasks: loadTasks,
-       picks: loadPicks, reports: loadReports, favorites: loadFavorites,
-       settings: loadSettings }[name] || (() => {}) )();
-  } catch (e) {
-    console.error(`view ${name} failed:`, e);
-    const box = $(`section[data-view="${name}"]`);
-    if (box) box.insertAdjacentHTML("afterbegin",
-      `<div class="task-empty" style="border-color:var(--red)">视图加载出错：${esc(e.message)}（可尝试强制刷新 Cmd+Shift+R）</div>`);
-  }
-}
 /* ---------------- 实时状态：全局轮询 + 常驻状态栏 ---------------- */
 function curView() { return (location.hash || "#dashboard").slice(1) || "dashboard"; }
 
