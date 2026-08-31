@@ -149,8 +149,10 @@ def evaluate_value_stock(code: str, name: str, price: float, curr_date: str) -> 
     if roe_metric.get("score", 0) == 0 and (roe_metric.get("value", 0) or 0) < 5:
         return None
 
-    eps = r.get("摊薄每股收益(元)")
-    pe_est = float(price) / float(eps) if eps and pd.notna(eps) and float(eps) > 0 else None
+    from tradingagents.dataflows.sina_stock import compute_ttm_eps
+
+    ttm_eps = compute_ttm_eps(ratios)
+    pe_est = float(price) / ttm_eps if ttm_eps and ttm_eps > 0 else None
 
     # Phase 2: Baidu PB + market cap (only for survivors, ~0.5s)
     pb = None

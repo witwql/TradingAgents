@@ -446,6 +446,51 @@ _FUND_NOTE_TMPL = (
 )
 
 
+def compute_ttm_eps(ratios: "pd.DataFrame") -> float | None:
+    """从新浪财务分析指标表计算 TTM（滚动 12 个月）EPS。
+
+    新浪的摊薄每股收益是累计值（Q1=3个月, H1=6个月, Q3=9个月, 年报=12个月）。
+    TTM = 最新累计 + 去年全年 - 去年同期累计。
+    若数据不全则退化为最近年报 EPS（静态 PE 口径）。
+    """
+    if ratios is None or ratios.empty:
+        return None
+    by_date = ratios.sort_values("日期", ascending=False).reset_index(drop=True)
+    latest = by_date.iloc[0]
+    latest_month = pd.to_datetime(latest["日期"]).month
+
+    def _eps(row):
+        v = row.get("摊薄每股收益(元)")
+        return float(v) if v is not None and pd.notna(v) else None
+
+    latest_eps = _eps(latest)
+    if latest_eps is None:
+        return None
+
+    # 年报直接用
+    if latest_month == 12:
+        return latest_eps
+
+    # 找去年年报 + 去年同期
+    prev_year = pd.to_datetime(latest["日期"]).year - 1
+    annual = None
+    same_period = None
+    for _, row in by_date.iterrows():
+        d = pd.to_datetime(row["日期"])
+        if d.year == prev_year and d.month == 12:
+            annual = _eps(row)
+        if d.year == prev_year and d.month == latest_month:
+            same_period = _eps(row)
+    if annual is not None and same_period is not None:
+        return latest_eps + (annual - same_period)
+
+    # 退化为最近年报 EPS
+    for _, row in by_date.iterrows():
+        if pd.to_datetime(row["日期"]).month == 12:
+            return _eps(row)
+    return latest_eps
+
+
 def _fund_not_applicable(label: str) -> str:
     return _FUND_NOTE_TMPL.format(label=label)
 
@@ -523,11 +568,11 @@ def get_fundamentals_sina(
                 v = r.get(cn)
                 if v is not None and pd.notna(v) and v != 0:
                     lines.append(f"{en}: {v}")
-            # PE estimate from latest price / diluted EPS
-            eps = r.get("摊薄每股收益(元)")
-            if eps is not None and pd.notna(eps) and eps > 0 and not data.empty:
-                pe_est = float(data["Close"].iloc[-1]) / float(eps)
-                lines.append(f"PE (estimated, price/EPS): {pe_est:.1f}")
+            # PE-TTM: price / trailing-twelve-month EPS (matches broker apps)
+            ttm_eps = compute_ttm_eps(ratios)
+            if ttm_eps and ttm_eps > 0 and not data.empty:
+                pe_ttm = float(data["Close"].iloc[-1]) / ttm_eps
+                lines.append(f"PE-TTM (price/TTM EPS): {pe_ttm:.1f}")
     except Exception as exc:
         logger.warning("sina financial indicators unavailable: %s", exc)
 
