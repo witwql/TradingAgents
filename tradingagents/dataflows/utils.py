@@ -1,10 +1,22 @@
+import glob
+import logging
+import os
 import re
+import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Annotated
 
 import pandas as pd
 
+logger = logging.getLogger(__name__)
+
 SavePathType = Annotated[str, "File path to save data. If None, data is not saved."]
+
+# Janitor retention for data_cache_dir. Cache files are re-fetched on demand,
+# so pruning only costs a network round-trip on the next use; 14 days covers
+# everything touched by a weekly workflow while bounding disk usage.
+CACHE_RETENTION_DAYS = 14
 
 # Tickers can contain letters, digits, dot, dash, underscore, caret
 # (index symbols like ^GSPC), equals (futures like GC=F), and plus
@@ -73,3 +85,119 @@ def get_next_weekday(date):
         return next_weekday
     else:
         return date
+
+
+# ---------------------------------------------------------------------------
+# Cache housekeeping
+# ---------------------------------------------------------------------------
+
+# OHLCV/statement caches key their filename on "today", so every day would
+# otherwise mint a fresh multi-MB file while superseded ones linger forever
+# (~250 stocks/day of screening adds tens of GB a year). Write-time pruning
+# keeps the hot set at one file per (ticker, vendor); the mtime janitor at
+# server startup reclaims files for tickers no longer being analyzed.
+
+
+def prune_superseded_cache_files(current_path: str | Path, pattern: str) -> int:
+    """Delete cache files matching ``pattern`` except ``current_path``.
+
+    Called right after writing a fresh cache file so the newest wins and its
+    older siblings (yesterday's windows, last quarter's statement dump) go
+    away. Never raises: a failed unlink only means one stale file lingers.
+    Returns the number of files removed.
+    """
+    removed = 0
+    keep = str(current_path)
+    try:
+        for candidate in glob.glob(pattern):
+            if os.path.abspath(candidate) == os.path.abspath(keep):
+                continue
+            try:
+                os.unlink(candidate)
+                removed += 1
+            except OSError:
+                logger.debug("cache prune skipped %s", candidate, exc_info=True)
+    except Exception:
+        logger.debug("cache prune failed for pattern %s", pattern, exc_info=True)
+    return removed
+
+
+# Filename families where only the newest member per (ticker [, kind]) is
+# ever read again: the name embeds the fetch day, so every run mints another
+# file and superseded siblings are dead weight. Explicit list — a novel cache
+# family must opt in, it is never collapsed by accident.
+_COLLAPSE_FAMILIES = (
+    ("-Sina-data-", False),
+    ("-AkShare-data-", False),
+    ("-Sina-stmt-", True),   # group also by statement kind (利润表/资产负债表/…)
+)
+
+_TRAILING_DATE_RE = re.compile(r"-\d{4}-\d{2}-\d{2}\.csv$")
+
+
+def _collapse_windowed_cache_files(cache_dir: str) -> int:
+    """Keep only the newest file per (ticker [, statement kind]) family."""
+    groups: dict[str, list[str]] = {}
+    for marker, kind_aware in _COLLAPSE_FAMILIES:
+        for path in glob.glob(os.path.join(cache_dir, f"*{marker}*.csv")):
+            base = os.path.basename(path)
+            head, _, tail = base.partition(marker)
+            if kind_aware:
+                head = f"{head}|{_TRAILING_DATE_RE.sub('', tail)}"
+            groups.setdefault(head, []).append(path)
+
+    removed = 0
+    for paths in groups.values():
+        if len(paths) <= 1:
+            continue
+        newest = max(paths, key=os.path.getmtime)
+        for path in paths:
+            if path == newest:
+                continue
+            try:
+                os.unlink(path)
+                removed += 1
+            except OSError:
+                logger.debug("cache collapse skipped %s", path, exc_info=True)
+    return removed
+
+
+def prune_stale_cache_files(cache_dir: str | Path | None = None,
+                            max_age_days: int = CACHE_RETENTION_DAYS) -> int:
+    """Janitor: collapse per-day cache families, then drop stale leftovers.
+
+    Two passes:
+    1. Collapse windowed families (`*-Sina-data-*`, `*-AkShare-data-*`,
+       `*-Sina-stmt-*`): these embed the fetch day in the filename, so only
+       the newest file per (ticker [, statement kind]) is ever read again.
+       This reclaims pre-existing backlogs the moment the server starts.
+    2. Unlink any remaining cache file untouched for ``max_age_days`` — the
+       catch-all for files whose ticker stopped being analyzed (flow caches,
+       future families).
+
+    Directory-safe (only regular files are removed) and never raises — the
+    dashboard calls this at startup, where a cache hiccup must not block
+    boot. Returns the number of files removed.
+    """
+    if cache_dir is None:
+        from .config import get_config
+
+        cache_dir = get_config()["data_cache_dir"]
+    removed = _collapse_windowed_cache_files(str(cache_dir))
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        entries = os.scandir(cache_dir)
+    except OSError:
+        return removed
+    with entries:
+        for entry in entries:
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if entry.stat().st_mtime >= cutoff:
+                    continue
+                os.unlink(entry.path)
+                removed += 1
+            except OSError:
+                logger.debug("cache janitor skipped %s", entry.path, exc_info=True)
+    return removed

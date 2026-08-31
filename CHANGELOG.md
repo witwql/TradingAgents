@@ -70,6 +70,13 @@ Breaking changes within the 0.x line are called out explicitly.
   ROE is now ×12/months with the metric relabeled `ROE(年化)`.
 
 ### Changed
+- **Data cache is now self-cleaning.** Per-day OHLCV windows minted a new
+  multi-MB file per (ticker, day) forever — ~250 stocks/day of screening
+  added tens of GB a year. Writes now supersede the same (ticker, vendor)'s
+  older files, Sina statements are disk-cached per day (statement renders and
+  `compute_ttm_net_profit` fetch each table once a day instead of per call),
+  and the dashboard startup janitor collapses windowed-family backlogs and
+  removes cache files untouched for 14 days.
 - **Default LLM is GLM-5.3-Flash via Zhipu BigModel** (`glm-cn`,
   `ZHIPU_CN_API_KEY`) for both deep and quick think; the dashboard default
   model, CLI catalog and smoke-script preset follow. Switch back per provider

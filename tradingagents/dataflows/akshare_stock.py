@@ -49,7 +49,7 @@ from .stockstats_utils import (
     _needs_same_day_refresh,
 )
 from .symbol_utils import ashare_exchange, is_fund_symbol, normalize_symbol
-from .utils import safe_ticker_component
+from .utils import prune_superseded_cache_files, safe_ticker_component
 from .y_finance import INDICATOR_DESCRIPTIONS
 
 logger = logging.getLogger(__name__)
@@ -233,6 +233,12 @@ def fetch_daily_ohlcv_akshare(
                 symbol, canonical, f"AKShare returned no rows for {acode}"
             )
         data.to_csv(data_file, index=False, encoding="utf-8")
+        # Filename embeds today's date — superseded windows are dead weight.
+        prune_superseded_cache_files(
+            data_file,
+            os.path.join(config["data_cache_dir"],
+                         f"{safe_ticker_component(canonical)}-AkShare-data-*.csv"),
+        )
 
     data = _clean_dataframe(data)
 

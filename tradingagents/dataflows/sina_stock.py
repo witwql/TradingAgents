@@ -44,7 +44,7 @@ from .stockstats_utils import (
     _needs_same_day_refresh,
 )
 from .symbol_utils import ashare_exchange, is_fund_symbol, normalize_symbol
-from .utils import safe_ticker_component
+from .utils import prune_superseded_cache_files, safe_ticker_component
 from .y_finance import INDICATOR_DESCRIPTIONS
 
 logger = logging.getLogger(__name__)
@@ -165,6 +165,13 @@ def fetch_daily_ohlcv_sina(
         if data.empty or "Close" not in data.columns:
             raise NoMarketDataError(symbol, canonical, f"sina returned no rows for {scode}")
         data.to_csv(data_file, index=False, encoding="utf-8")
+        # The filename embeds today's date, so each day mints a new 5-year
+        # file; superseded siblings for this ticker are dead weight.
+        prune_superseded_cache_files(
+            data_file,
+            os.path.join(config["data_cache_dir"],
+                         f"{safe_ticker_component(canonical)}-Sina-data-*.csv"),
+        )
 
     data = _clean_dataframe(data)
     data = data[data["Date"] <= curr_date_dt]
@@ -307,13 +314,52 @@ _STATEMENT_FIELDS: dict[str, list[tuple[str, tuple[str, ...]]]] = {
 _STATEMENT_PERIODS = 6
 
 
+def _stmt_cache_key(scode: str) -> str:
+    """One cache key per stock regardless of scode form ('sz002466' vs '002466')."""
+    digits = "".join(ch for ch in str(scode) if ch.isdigit())
+    if len(digits) == 6:
+        exchange = ashare_exchange(digits) or ("SH" if digits.startswith("6") else "SZ")
+        return exchange.lower() + digits
+    return safe_ticker_component(str(scode))
+
+
 def _fetch_statement_raw(scode: str, cn_kind: str) -> pd.DataFrame:
-    """Rows = reported periods; drop the annoying trailing summary rows."""
-    df = _quiet(ak.stock_financial_report_sina, stock=scode, symbol=cn_kind)
-    if df is None or df.empty:
-        raise NoMarketDataError(scode, scode, f"sina {cn_kind} empty")
-    if "报告日" not in df.columns:
-        raise NoMarketDataError(scode, scode, f"sina {cn_kind} missing 报告日")
+    """Rows = reported periods, disk-cached per (stock, kind, day).
+
+    A statement changes at most once per day (a new disclosure) while the
+    wide table costs a full fetch per call — the value screener and
+    ``compute_ttm_net_profit`` hit this repeatedly across runs. Cached reads
+    come back as strings; every consumer already re-coerces via
+    ``pd.to_numeric`` / ``pd.to_datetime``. Same-day files supersede their
+    siblings, so the cache stays one file per (stock, kind).
+    """
+    config = get_config()
+    cache_dir = config["data_cache_dir"]
+    key = _stmt_cache_key(scode)
+    today = pd.Timestamp.today().strftime("%Y-%m-%d")
+    cache_file = os.path.join(cache_dir, f"{key}-Sina-stmt-{cn_kind}-{today}.csv")
+
+    df = None
+    if os.path.exists(cache_file):
+        try:
+            cached = pd.read_csv(cache_file, dtype=str)
+            if not cached.empty and "报告日" in cached.columns:
+                df = cached
+        except Exception:
+            logger.warning("sina statement cache unreadable, refetching: %s", cache_file)
+
+    if df is None:
+        df = _quiet(ak.stock_financial_report_sina, stock=scode, symbol=cn_kind)
+        if df is None or df.empty:
+            raise NoMarketDataError(scode, scode, f"sina {cn_kind} empty")
+        if "报告日" not in df.columns:
+            raise NoMarketDataError(scode, scode, f"sina {cn_kind} missing 报告日")
+        os.makedirs(cache_dir, exist_ok=True)
+        df.to_csv(cache_file, index=False, encoding="utf-8")
+        prune_superseded_cache_files(
+            cache_file,
+            os.path.join(cache_dir, f"{key}-Sina-stmt-{cn_kind}-*.csv"),
+        )
     return df
 
 
@@ -459,7 +505,12 @@ def compute_ttm_net_profit(scode: str, curr_date: str | None = None) -> float | 
     period-end gating applies — same documented tradeoff as the statement
     renderer).
     """
-    raw = _quiet(ak.stock_financial_report_sina, stock=scode, symbol="利润表")
+    try:
+        raw = _fetch_statement_raw(scode, "利润表")
+    except VendorNotConfiguredError:
+        raise
+    except Exception:
+        return None
     if raw is None or raw.empty or "报告日" not in raw.columns:
         return None
 

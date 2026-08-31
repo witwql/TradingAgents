@@ -1,5 +1,7 @@
 """Sina fallback vendor unit tests — no network unless marked integration."""
 import copy
+import glob
+import os
 import tempfile
 from unittest import mock
 
@@ -213,11 +215,44 @@ class TestFundamentalsValuationTests:
     def test_ttm_net_profit_curr_date_gate(self):
         fake = mock.Mock()
         fake.stock_financial_report_sina.return_value = self._income()
-        with mock.patch.object(sina, "ak", fake):
+        with mock.patch.object(sina, "ak", fake), _cache_ctx(tempfile.mkdtemp()):
             # as of 2026-07-01 only H1'26 visible: TTM = 30 + 40 - 15 = 55亿
             assert sina.compute_ttm_net_profit("sh600519", "2026-07-01") == 55e8
             # as of 2026-04-01 only Q1'26 visible: TTM = 10 + 40 - 8 = 42亿
             assert sina.compute_ttm_net_profit("sh600519", "2026-04-01") == 42e8
+
+    def test_statement_fetched_once_per_day(self):
+        """Second same-day call (any scode form) must reuse the disk cache."""
+        fake = mock.Mock()
+        fake.stock_financial_report_sina.return_value = self._income()
+        with mock.patch.object(sina, "ak", fake), _cache_ctx(tempfile.mkdtemp()):
+            assert sina.compute_ttm_net_profit("sh600519", "2026-07-01") == 55e8
+            # prefixed and bare forms share one cache key
+            assert sina.compute_ttm_net_profit("600519", "2026-07-01") == 55e8
+            assert sina.compute_ttm_net_profit("600519") == 55e8
+            assert fake.stock_financial_report_sina.call_count == 1
+
+    def test_statement_cache_supersedes_old_files(self):
+        fake = mock.Mock()
+        fake.stock_financial_report_sina.return_value = self._income()
+        cache = tempfile.mkdtemp()
+        stale = os.path.join(cache, "sh600519-Sina-stmt-利润表-2020-01-01.csv")
+        open(stale, "w").close()
+        with mock.patch.object(sina, "ak", fake), _cache_ctx(cache):
+            sina.compute_ttm_net_profit("sh600519")
+        assert not os.path.exists(stale)
+        assert len(glob.glob(os.path.join(cache, "sh600519-Sina-stmt-*.csv"))) == 1
+
+    def test_daily_ohlcv_cache_supersedes_old_windows(self):
+        fake = mock.Mock()
+        fake.stock_zh_a_daily.return_value = _frame()
+        cache = tempfile.mkdtemp()
+        stale = os.path.join(cache, "600519.SS-Sina-data-2020-01-01-2025-01-01.csv")
+        open(stale, "w").close()
+        with mock.patch.object(sina, "ak", fake), _cache_ctx(cache):
+            sina.get_stock_data_sina("600519.SS", "2026-06-22", "2026-06-25")
+        assert not os.path.exists(stale)
+        assert len(glob.glob(os.path.join(cache, "600519.SS-Sina-data-*.csv"))) == 1
 
 
 @pytest.mark.unit

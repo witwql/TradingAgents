@@ -1,10 +1,20 @@
 """Value screener evaluation tests: ROE annualization + look-ahead gating."""
+import tempfile
 from unittest import mock
 
 import pandas as pd
 import pytest
 
 import server.value_screener as vs
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cache(monkeypatch):
+    """Keep the statement cache out of the real ~/.tradingagents/cache."""
+    import tradingagents.dataflows.config as config_module
+
+    monkeypatch.setattr(config_module, "_config",
+                        {**config_module.get_config(), "data_cache_dir": tempfile.mkdtemp()})
 
 
 def _ratio_row(period, roe):

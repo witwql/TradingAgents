@@ -178,6 +178,19 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
     sweep = db.sweep_interrupted()
     if sweep.get("screen_runs") or sweep.get("tasks"):
         logger.warning("swept interrupted runs: %s", sweep)
+
+    # Reclaim data-cache files untouched for CACHE_RETENTION_DAYS (per-day
+    # OHLCV/flow/statement caches would otherwise accumulate unboundedly).
+    try:
+        from tradingagents.dataflows.config import get_config
+        from tradingagents.dataflows.utils import prune_stale_cache_files
+
+        pruned = prune_stale_cache_files(get_config()["data_cache_dir"])
+        if pruned:
+            logger.info("startup cache prune removed %d stale files", pruned)
+    except Exception:
+        logger.exception("startup cache prune failed (ignored)")
+
     scheduler = ScreeningScheduler(db)
     if start_spot:
         scheduler.start()
