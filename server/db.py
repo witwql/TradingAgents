@@ -62,6 +62,22 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS value_runs (
+    id TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    finished_at REAL,
+    status TEXT NOT NULL DEFAULT 'running',
+    trade_date TEXT NOT NULL DEFAULT '',
+    universe INTEGER NOT NULL DEFAULT 0,
+    stage TEXT NOT NULL DEFAULT '',
+    processed INTEGER NOT NULL DEFAULT 0,
+    total INTEGER NOT NULL DEFAULT 0,
+    qualifying INTEGER NOT NULL DEFAULT 0,
+    results TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    cancel_requested INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS screen_runs (
     id TEXT PRIMARY KEY,
     created_at REAL NOT NULL,
@@ -99,6 +115,11 @@ class Database:
             ("screen_runs", "total", "INTEGER NOT NULL DEFAULT 0"),
             ("screen_runs", "qualifying", "INTEGER NOT NULL DEFAULT 0"),
             ("screen_runs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+            ("value_runs", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+            ("value_runs", "stage", "TEXT NOT NULL DEFAULT ''"),
+            ("value_runs", "processed", "INTEGER NOT NULL DEFAULT 0"),
+            ("value_runs", "total", "INTEGER NOT NULL DEFAULT 0"),
+            ("value_runs", "qualifying", "INTEGER NOT NULL DEFAULT 0"),
         ):
             cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
             if column not in cols:
@@ -222,7 +243,7 @@ class Database:
         here prevents UIs from waiting on ghosts forever.
         """
         now = time.time()
-        counts = {"screen_runs": 0, "tasks": 0}
+        counts = {"screen_runs": 0, "tasks": 0, "value_runs": 0}
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE screen_runs SET status='failed', error='服务重启，运行中断',"
@@ -231,6 +252,12 @@ class Database:
             )
             counts["screen_runs"] = cur.rowcount
             cur = self._conn.execute(
+                "UPDATE value_runs SET status='failed', error='服务重启，运行中断',"
+                " finished_at=? WHERE status='running' AND created_at < ?",
+                (now, now - max_running_age),
+            )
+            counts["value_runs"] = cur.rowcount
+            cur = self._conn.execute(
                 "UPDATE tasks SET status='failed', error='服务重启，运行中断',"
                 " finished_at=? WHERE status='running' AND started_at < ?",
                 (now, now - max_running_age),
@@ -238,6 +265,15 @@ class Database:
             counts["tasks"] = cur.rowcount
             self._conn.commit()
         return counts
+
+    def request_value_cancel(self, run_id: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE value_runs SET cancel_requested=1 WHERE id=? AND status='running'",
+                (run_id,),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def begin_screen_run(self, run_id: str, trade_date: str, reuse_window: float = 1800) -> tuple[str, bool]:
         """Atomically create a screening run or reuse an in-flight one.

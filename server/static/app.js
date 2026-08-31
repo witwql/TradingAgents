@@ -24,7 +24,7 @@ const STAGE_TEXT = {
   bull_researcher: "多方研究", bear_researcher: "空方研究", research_manager: "研究裁决",
   trader: "交易决策", risk_debate: "风险辩论", portfolio_manager: "终审",
 };
-const state = { filterStatus: "", drawerTaskId: null, drawerES: null, cache: {}, feedCount: 0, feedScroll: true, lastScreenRun: null };
+const state = { filterStatus: "", drawerTaskId: null, drawerES: null, cache: {}, feedCount: 0, feedScroll: true, lastScreenRun: null, lastValueRun: null };
 
 /* ---------------- router ---------------- */
 const VIEWS = ["dashboard", "new", "tasks", "picks", "reports", "favorites", "settings"];
@@ -673,15 +673,189 @@ function loadView(name) {
 }
 /* ---------------- 实时状态：全局轮询 + 常驻状态栏 ---------------- */
 
-/* ---------------- 明日精选 ---------------- */
-const screenPoll = { timer: null, fails: 0 };
-let screenPrevStatus = null;
+
+/* ---------------- 价值精选 ---------------- */
+const valuePoll = { timer: null, fails: 0, watching: false };
+let valuePrevStatus = null;
+
+function switchPicksTab(tab) {
+  $$("#picks-tabs .seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  $("#tab-momentum").classList.toggle("hidden", tab !== "momentum");
+  $("#tab-value").classList.toggle("hidden", tab !== "value");
+  if (tab === "value") pollValueScreen();
+  else pollScreening();
+}
 
 function loadPicks() {
+  $$("#picks-tabs .seg-btn").forEach((b) =>
+    b.onclick = () => switchPicksTab(b.dataset.tab));
   clearTimeout(screenPoll.timer);
   screenPoll.fails = 0;
   pollScreening();
 }
+
+async function startValueScreening() {
+  const btn = $("#value-run");
+  btn.disabled = true; btn.textContent = "启动中…";
+  try {
+    const resp = await api("/value-screen", { method: "POST" });
+    showToast(resp.already_running ? "价值筛选已在运行" : "价值筛选已启动",
+              "新浪财务指标 → 百度估值 → 16分制评分");
+    valuePrevStatus = null;
+    valuePoll.fails = 0;
+    pollValueScreen();
+  } catch (e) {
+    btn.disabled = false; btn.textContent = "▶ 运行价值筛选";
+    showToast("启动失败", e.message, true);
+  }
+}
+
+async function cancelValueScreening() {
+  const r = state.lastValueRun;
+  if (!r || r.status !== "running") return;
+  try {
+    await api("/value-screen/cancel", { method: "POST", body: { run_id: r.id } });
+    showToast("已请求停止", "完成当前个股后终止");
+    $("#vs-stop").disabled = true;
+  } catch (e) { showToast("停止失败", e.message, true); }
+}
+
+const VALUE_STAGE_HINTS = {
+  universe: { text: "拉取沪深主板股票池", hint: "约 15-20 秒" },
+  analyzing: { text: "逐股评估（新浪财务指标 → 百度估值 → 评分）", hint: "两阶段：先 Sina 比率快筛，再 Baidu PB 精评" },
+};
+
+async function pollValueScreen() {
+  clearTimeout(valuePoll.timer);
+  let r = null;
+  try { r = (await api("/value-screen/latest")).run; valuePoll.fails = 0; }
+  catch { valuePoll.fails++; }
+
+  if (!r) {
+    if (valuePoll.fails <= 3) {
+      $("#value-meta").innerHTML = `<span style="color:var(--amber)">连接波动，${3*valuePoll.fails}s 后重试…</span>`;
+      valuePoll.timer = setTimeout(pollValueScreen, 3000 * valuePoll.fails);
+    } else {
+      $("#value-run").disabled = false; $("#value-run").textContent = "▶ 运行价值筛选";
+      $("#value-status").classList.add("hidden");
+      $("#value-meta").innerHTML = `<span style="color:var(--red)">连接失败，请刷新页面。</span>`;
+    }
+    return;
+  }
+
+  state.lastValueRun = r;
+  renderValueStatus(r);
+
+  if (r.status === "running") {
+    valuePoll.watching = true;
+    $("#value-run").disabled = true;
+    $("#value-run").textContent = `筛选中… ${r.processed ?? 0}/${r.total ?? "?"}`;
+    valuePoll.timer = setTimeout(pollValueScreen, 2000);
+    return;
+  }
+
+  valuePoll.watching = false;
+  $("#value-run").disabled = false; $("#value-run").textContent = "▶ 运行价值筛选";
+  $("#value-status").classList.add("hidden");
+  renderValueHistory();
+  const sawRunning = valuePrevStatus === "running";
+
+  if (r.status === "failed") {
+    $("#value-meta").innerHTML = `运行失败：<span style="color:var(--red)">${esc((r.error||"").slice(0,120))}</span>`;
+    $("#value-list").innerHTML = "";
+    if (sawRunning) showToast("价值筛选失败", (r.error||"").slice(0,60), true);
+    valuePrevStatus = r.status; return;
+  }
+  if (r.status === "cancelled") {
+    $("#value-meta").textContent = `已停止 · 中止前评估 ${r.evaluated ?? r.processed ?? 0} 只`;
+    $("#value-list").innerHTML = `<div class="task-empty">已停止，已评估数据已缓存。</div>`;
+    valuePrevStatus = r.status; return;
+  }
+
+  const picks = r.picks || [], wl = r.watchlist || [];
+  $("#value-meta").textContent =
+    `最近完成 ${fmtTime(r.created_at)} · 池 ${r.universe ?? "?"} · 评估 ${r.evaluated ?? "?"} · 入榜 ${r.qualifying ?? 0}`;
+  let html = "";
+  if (picks.length) {
+    html += `<h3 style="margin:4px 0 10px">✅ 价值精选（≥${picks[picks.length-1]?.score ?? 0}分）</h3>`;
+    html += picks.map((p, i) => valuePickCard(p, i)).join("");
+  } else {
+    html += `<div class="task-empty">今日无标的达到 ${8} 分门槛。以下观察名单供参考。</div>`;
+  }
+  if (wl.length) {
+    html += `<h3 style="margin:16px 0 10px">👁 观察名单（接近门槛）</h3>`;
+    html += wl.map((p, i) => valuePickCard(p, i, true)).join("");
+  }
+  $("#value-list").innerHTML = html;
+  if (sawRunning) {
+    showToast(`价值筛选完成：入榜 ${picks.length} 只`, picks.length ? `最高 ${picks[0].score}/16 分` : "");
+    setTimeout(() => $("#value-list").scrollIntoView({ behavior: "smooth", block: "start" }), 150);
+  }
+  valuePrevStatus = r.status;
+}
+
+function renderValueStatus(r) {
+  const card = $("#value-status");
+  if (r.status !== "running") { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  const st = VALUE_STAGE_HINTS[r.stage] || VALUE_STAGE_HINTS.analyzing;
+  $("#vs-stage").textContent = st.text;
+  $("#vs-hint").textContent = st.hint;
+  const done = r.processed ?? 0, total = r.total ?? 0;
+  $("#vs-count").textContent = total ? `${done}/${total} · 入榜 ${r.qualifying ?? 0}` : "";
+  $("#vs-bar-wrap").classList.toggle("indeterminate", !total);
+  $("#vs-bar").style.width = total ? Math.round((done/total)*100) + "%" : "30%";
+  $("#vs-stop").disabled = false;
+  const started = r.created_at ? (Date.now()-r.created_at*1000)/1000 : 0;
+  $("#vs-elapsed").textContent = started ? `已运行 ${Math.floor(started/60)}分${String(Math.floor(started%60)).padStart(2,"0")}秒` : "";
+}
+
+async function renderValueHistory() {
+  const data = await api("/value-screen/history?limit=8").catch(() => null);
+  const box = $("#value-history");
+  if (!box) return;
+  const runs = (data && data.runs) || [];
+  if (!runs.length) { box.innerHTML = ""; return; }
+  box.innerHTML = `<h3>历史运行</h3><table class="sh-table">
+    <tr><th>时间</th><th>状态</th><th>池</th><th>评估</th><th>入榜</th><th>最高分</th></tr>` +
+    runs.map((h) => `<tr><td>${fmtTime(h.created_at)}</td>
+      <td><span class="badge ${h.status}">${STATUS_TEXT[h.status] || h.status}</span></td>
+      <td>${h.universe ?? "—"}</td><td>${h.evaluated ?? "—"}</td>
+      <td>${h.qualifying ?? "—"}</td>
+      <td>${h.top_score != null ? h.top_score + "/16" : "—"}</td></tr>`).join("") + `</table>`;
+}
+
+function valuePickCard(p, idx, muted = false) {
+  const pct = Math.round((p.score / p.max_score) * 100);
+  const m = p.metrics || {};
+  const chips = Object.entries(m).map(([k, v]) => {
+    const cls = v.score >= 2 ? "good" : (v.score >= 1 ? "warn" : (v.score < 0 ? "bad" : ""));
+    const val = v.value != null ? v.value : "N/A";
+    return `<span class="vs-metric ${cls}">${esc(k)}: <b>${val}</b> (${v.score})</span>`;
+  }).join("");
+  return `<div class="pick-card"${muted ? ' style="opacity:.82"' : ""}>
+    <div class="pick-head">
+      <div class="pick-rank">${idx+1}</div>
+      <span class="pick-ticker">${esc(p.code)}</span>
+      <span>${esc(p.name)}</span>
+      <span class="pick-price">¥${(p.price ?? 0).toFixed(2)}</span>
+      <span class="muted" style="font-size:12px">${esc(p.period || "")}</span>
+      <div class="pick-prob">
+        <div class="num">${p.score}/${p.max_score}</div>
+        <div class="lbl">综合评分</div>
+      </div>
+      <button class="btn small primary" onclick="event.stopPropagation();deepResearch('${p.code}')">🔬 深度研究</button>
+    </div>
+    <div class="prob-bar"><i style="width:${pct}%"></i></div>
+    <div class="factor-chips">${chips}</div>
+  </div>`;
+}
+
+/* ---------------- 明日精选 ---------------- */
+const screenPoll = { timer: null, fails: 0 };
+let screenPrevStatus = null;
+
+
 
 async function deepResearch(code) {
   if (deepResearch._pending) return;               // 防连点

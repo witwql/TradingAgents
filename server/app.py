@@ -416,6 +416,54 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
             raise HTTPException(409, "运行不存在或已结束")
         return {"cancelling": run_id}
 
+    @app.post("/api/value-screen", status_code=202)
+    def value_screen_start():
+        from .value_screener import run_value_screening
+
+        run_id, already = run_value_screening(db)
+        return {"run_id": run_id, "already_running": already}
+
+    @app.post("/api/value-screen/cancel")
+    async def value_screen_cancel(request: Request):
+        body = await request.json()
+        run_id = str(body.get("run_id", ""))
+        ok = db.request_value_cancel(run_id)
+        if not ok:
+            raise HTTPException(409, "运行不存在或已结束")
+        return {"cancelling": run_id}
+
+    @app.get("/api/value-screen/latest")
+    def value_screen_latest():
+        from .value_screener import latest_value_run
+
+        run = latest_value_run(db)
+        if not run:
+            return {"run": None}
+        return {
+            "run": {
+                "id": run["id"],
+                "status": run["status"],
+                "trade_date": run["trade_date"],
+                "created_at": run["created_at"],
+                "finished_at": run["finished_at"],
+                "universe": run["universe"],
+                "stage": run.get("stage", ""),
+                "processed": run.get("processed", 0),
+                "total": run.get("total", 0),
+                "error": run["error"],
+                "evaluated": (run["results"] or {}).get("evaluated"),
+                "qualifying": (run["results"] or {}).get("qualifying"),
+                "picks": (run["results"] or {}).get("picks", []),
+                "watchlist": (run["results"] or {}).get("watchlist", []),
+            }
+        }
+
+    @app.get("/api/value-screen/history")
+    def value_screen_history(limit: int = 10):
+        from .value_screener import value_history
+
+        return {"runs": value_history(db, limit=min(limit, 50))}
+
     @app.get("/api/screen/history")
     def screen_history(limit: int = 10):
         from .screener import history

@@ -4,7 +4,7 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>TradingAgents Dashboard - 多智能体股票分析</title>
-<link rel="stylesheet" href="/static/style.css?v=20260828e"/>
+<link rel="stylesheet" href="/static/style.css?v=20260901a"/>
 </head>
 <body>
 <header class="topbar">
@@ -85,10 +85,19 @@
   <!-- ============ 明日精选 ============ -->
   <section data-view="picks" class="view">
     <div class="tasks-head">
-      <h2>明日精选 <span class="muted" style="font-size:13px;font-weight:400">主板 · 多因子共振 · P(次日上涨)≥80%</span></h2>
-      <button class="btn primary" id="screen-run" onclick="startScreening()">▶ 运行筛选</button>
+      <h2>明日精选</h2>
+      <div class="seg" id="picks-tabs">
+        <button class="seg-btn active" data-tab="momentum">多因子共振</button>
+        <button class="seg-btn" data-tab="value">价值精选</button>
+      </div>
     </div>
 
+    <!-- ========= 多因子共振 ========= -->
+    <div id="tab-momentum" class="picks-tab">
+      <div class="tasks-head" style="margin:0 0 10px">
+        <span class="muted" style="font-size:12.5px">主板 · 5+1因子 · P(次日上涨)≥80%</span>
+        <button class="btn primary" id="screen-run" onclick="startScreening()">▶ 运行筛选</button>
+      </div>
     <div id="screen-status" class="screen-status hidden">
       <div class="ss-row">
         <span class="spinner"></span>
@@ -104,6 +113,29 @@
     <div id="screen-meta" class="muted" style="font-size:12.5px;margin:14px 0 12px">尚未运行过筛选</div>
     <div id="picks-list" class="task-list"></div>
     <div id="screen-history" class="screen-history"></div>
+    </div><!-- /tab-momentum -->
+
+    <!-- ========= 价值精选 ========= -->
+    <div id="tab-value" class="picks-tab hidden">
+      <div class="tasks-head" style="margin:0 0 10px">
+        <span class="muted" style="font-size:12.5px">沪深主板 · 低估值+好财报+好业绩 · 16分制</span>
+        <button class="btn primary" id="value-run" onclick="startValueScreening()">▶ 运行价值筛选</button>
+      </div>
+      <div id="value-status" class="screen-status hidden">
+        <div class="ss-row">
+          <span class="spinner"></span>
+          <span id="vs-stage" class="ss-stage">准备中…</span>
+          <span id="vs-count" class="ss-count"></span>
+          <span id="vs-elapsed" class="ss-elapsed muted"></span>
+          <button class="btn small danger" id="vs-stop" onclick="cancelValueScreening()">■ 停止</button>
+        </div>
+        <div class="mini-bar indeterminate" id="vs-bar-wrap" style="max-width:none;margin-top:10px"><i id="vs-bar" style="width:0%"></i></div>
+        <div id="vs-hint" class="muted" style="font-size:11.5px;margin-top:6px"></div>
+      </div>
+      <div id="value-meta" class="muted" style="font-size:12.5px;margin:14px 0 12px">尚未运行过价值筛选</div>
+      <div id="value-list" class="task-list"></div>
+      <div id="value-history" class="screen-history"></div>
+    </div>
     <div class="card" style="margin-top:16px">
       <h3>⚠️ 模型性质与使用须知</h3>
       <p class="muted" style="font-size:12.5px">
@@ -189,6 +221,6 @@ ZHIPU_API_KEY=你的密钥       # 国际站 Z.AI
   学习研究用途 · 输出为 AI 生成的分析报告，不构成任何投资建议 · 数据来源：东方财富/AKShare
 </footer>
 
-<script src="/static/app.js?v=20260828e"></script>
+<script src="/static/app.js?v=20260901a"></script>
 </body>
 </html>

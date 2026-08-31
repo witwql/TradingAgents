@@ -310,3 +310,10 @@ h3 { font-size: 15px; margin-bottom: 10px; }
 }
 @keyframes slide { from { margin-left: -30%; } to { margin-left: 100%; } }
 .btn.danger.solid { background: var(--red); border-color: var(--red); color: #fff; }
+
+.picks-tab { } /* 容器，默认可见；hidden 由 JS 控制 */
+.vs-metric { display:inline-block; border:1px solid var(--border); border-radius:8px; padding:3px 10px; margin:3px 6px 3px 0; font-size:12px; }
+.vs-metric b { font-weight:600; }
+.vs-metric.good { border-color: var(--green); color: var(--green); }
+.vs-metric.warn { border-color: var(--amber); color: var(--amber); }
+.vs-metric.bad  { border-color: var(--red); color: var(--red); }
