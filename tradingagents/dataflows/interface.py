@@ -33,6 +33,7 @@ from .sina_stock import (
     get_balance_sheet_sina,
     get_cashflow_sina,
     get_fundamentals_sina,
+    get_global_news_sina,
     get_income_statement_sina,
     get_indicators_sina,
     get_stock_data_sina,
@@ -162,6 +163,7 @@ VENDOR_METHODS = {
         "yfinance": get_global_news_yfinance,
         "alpha_vantage": get_alpha_vantage_global_news,
         "akshare": get_global_news_akshare,
+        "sina": get_global_news_sina,
     },
     "get_insider_transactions": {
         "alpha_vantage": get_alpha_vantage_insider_transactions,

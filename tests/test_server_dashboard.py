@@ -423,3 +423,62 @@ class TestRetrospectiveFixes:
         q, client = _make(db)
         h = client.get("/api/health").json()
         assert h["db_path"] == db.path()  # 以真实连接为准，而非猜测的默认路径
+
+
+class TestEventBus:
+    def test_cross_thread_publish_reaches_async_subscriber(self):
+        import asyncio
+        import threading
+
+        from server.events import EventBus
+
+        bus = EventBus()
+        received = []
+
+        async def main():
+            q = await bus.subscribe("t1")
+            def produce():
+                bus.publish("t1", {"id": 1, "type": "node"})
+                bus.publish("t1", {"id": 2, "type": "status"})
+            threading.Thread(target=produce).start()
+            for _ in range(2):
+                ev = await asyncio.wait_for(q.get(), timeout=2)
+                received.append(ev)
+
+        asyncio.run(main())
+        assert [e["id"] for e in received] == [1, 2]
+
+    def test_unsubscribe_stops_delivery(self):
+        import asyncio
+
+        from server.events import EventBus
+
+        bus = EventBus()
+
+        async def main():
+            q = await bus.subscribe("t2")
+            bus.unsubscribe("t2", q)
+            bus.publish("t2", {"id": 1})
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(q.get(), timeout=0.2)
+
+        asyncio.run(main())
+
+    def test_sse_replays_full_history_and_closes_on_terminal(self, db):
+        """终态后订阅：流应重放全部事件并自动关闭（TestClient 无法测实时
+        推送——实时投递由 TestEventBus 的跨线程用例覆盖）。"""
+        FakeRunner.calls.clear()
+        q = TaskQueue(db, workers=0, runner_cls=FakeRunner)
+        client = TestClient(create_app(db=db, queue=q, start_spot=False))
+        (tid,) = client_submit(q, ["600519"])
+        q._execute(db.get_task(tid))          # 先完成，产生全部事件
+
+        got = b""
+        with client.stream("GET", f"/api/tasks/{tid}/events") as resp:
+            for chunk in resp.iter_raw():
+                got += chunk
+        body = got.decode()
+        assert '"type": "llm_start"' in body
+        assert '"status": "completed"' in body
+        # 终态后流必须自然关闭（不含心跳挂起）
+        assert body.count("data:") == len(db.events_since(tid, 0))

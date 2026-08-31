@@ -24,6 +24,7 @@ class TaskQueue:
         settings: dict[str, str] | None = None,
         workers: int = 1,
         runner_cls=None,
+        bus=None,
     ):
         from .runner import AnalysisRunner
 
@@ -31,6 +32,7 @@ class TaskQueue:
         self.settings = settings or {}
         self.workers = max(0, int(workers))
         self.runner_cls = runner_cls or AnalysisRunner
+        self.bus = bus
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
 
@@ -112,9 +114,17 @@ class TaskQueue:
 
         def emit(type_: str, payload: dict):
             try:
-                db.append_event(task_id, type_, payload)
+                event_id = db.append_event(task_id, type_, payload)
             except Exception:
                 logger.exception("append_event failed")
+                return
+            if self.bus is not None:
+                try:
+                    self.bus.publish(task_id, {
+                        "id": event_id, "type": type_, **payload,
+                    })
+                except Exception:
+                    logger.exception("event bus publish failed")
 
         emit("status", {"status": "running", "ticker": task["ticker"]})
         result: dict | None = None

@@ -264,3 +264,43 @@ class TestMoneyFlow:
         with mock.patch.object(gm, "load_ohlcv", return_value=target):
             out = gm.get_factor_exposure.func("600519.SS", "2026-06-24", 120)
         assert "主力资金净占比" in out
+
+
+class TestThsFallback:
+    def test_ths_snapshot_fallback_when_em_blocked(self, monkeypatch):
+        """EM 冷却期 → THS 榜单兜底返回单行快照。"""
+        import tradingagents.dataflows.money_flow as mf
+
+        # 触发冷却
+        mf._em_fail_until = __import__("time").time() + 600
+
+        ths = pd.DataFrame([
+            {"股票代码": "600519", "股票简称": "贵州茅台", "最新价": 1290.0,
+             "流入资金": "5.15亿", "流出资金": "3.65亿", "净额": "1.50亿",
+             "成交额": "8.80亿"},
+        ])
+        fake = mock.Mock()
+        fake.stock_fund_flow_individual.return_value = ths
+        monkeypatch.setattr(mf, "ak", fake)
+        monkeypatch.setattr(mf, "get_config",
+                            lambda: {"data_cache_dir": __import__("tempfile").mkdtemp()})
+
+        df = mf.fetch_money_flow("600519.SS", "2026-08-31", 30, retries=1)
+        assert len(df) == 1
+        assert df["_source"].iloc[-1] == "ths_snapshot"
+        assert abs(df["主力净流入-净额"].iloc[-1] - 1.5e8) < 1
+        assert abs(df["主力净流入-净占比"].iloc[-1] - (1.5e8 / 8.8e8 * 100)) < 0.1
+
+    def test_ths_miss_raises_no_data(self, monkeypatch):
+        import tradingagents.dataflows.money_flow as mf
+
+        mf._em_fail_until = __import__("time").time() + 600
+        ths = pd.DataFrame([{"股票代码": "000001", "净额": "1亿", "成交额": "5亿",
+                             "最新价": 12.0}])
+        fake = mock.Mock()
+        fake.stock_fund_flow_individual.return_value = ths
+        monkeypatch.setattr(mf, "ak", fake)
+        monkeypatch.setattr(mf, "get_config",
+                            lambda: {"data_cache_dir": __import__("tempfile").mkdtemp()})
+        with pytest.raises(NoMarketDataError):
+            mf.fetch_money_flow("600519.SS", "2026-08-31", 30, retries=1)

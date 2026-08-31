@@ -120,7 +120,7 @@ class AnalysisRunner:
                 "core_stock_apis": "sina,akshare,yfinance",
                 "technical_indicators": "sina,akshare,yfinance",
                 "fundamental_data": "sina,akshare,yfinance",
-                "news_data": "akshare,yfinance",
+                "news_data": "akshare,sina,yfinance",
                 "macro_data": "fred",
                 "prediction_markets": "polymarket",
             }

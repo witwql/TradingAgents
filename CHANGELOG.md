@@ -39,6 +39,14 @@ Breaking changes within the 0.x line are called out explicitly.
   reachable, instead of raising through ToolNode.
 - Screen-run double-start race made atomic; task cancel/claim race guarded;
   task_events now pruned to the most recent 50 tasks.
+- SSE task-events are now event-driven (server/events.py EventBus):
+  worker publishes after persisting, subscribers get live delivery via
+  thread→loop handoff with id-based dedup over the DB replay; per-connection
+  DB polling removed (heartbeats and auto-close on terminal state kept).
+- Money flow gains a THS snapshot fallback (当日即时榜 → 单行快照，净占比由
+  净额/成交额推算) behind an EM-failure cooldown window, so the macro analyst
+  keeps a same-day reading while EastMoney is throttled; global news gains a
+  Sina vendor (news chain: akshare,sina,yfinance).
 - tools/frontend_replay.js: replays app.js against a minimal DOM shim and the
   live backend, exposing runtime errors API tests cannot see; a new
   frontend-consistency test guards against silent HTML/JS drift.

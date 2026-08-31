@@ -159,9 +159,12 @@ _SETTING_KEYS = {
 
 def create_app(db: Database | None = None, queue: TaskQueue | None = None,
                start_spot: bool = True, args_db_path: str | None = None) -> FastAPI:
+    from .events import EventBus
+
     db = db or Database()
     db_path = args_db_path if args_db_path else default_db_path()
-    queue = queue or TaskQueue(db)
+    bus = EventBus()
+    queue = queue or TaskQueue(db, bus=bus)
     queue.start()
     spot_cache = SpotQuoteCache(
         _fetch_sina_spot,
@@ -181,6 +184,7 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
     app = FastAPI(title="TradingAgents Dashboard", version="0.1.0")
     app.state.db = db
     app.state.queue = queue
+    app.state.bus = bus
     app.state.spot = spot_cache
 
     # ------------------------------------------------------------------ meta
@@ -271,32 +275,50 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
             raise HTTPException(404, task_id)
 
         async def stream():
+            # Event-driven: DB replay first, then live bus events (dedup by
+            # id covers the replay/subscribe gap). The DB stays the source of
+            # truth; the bus only removes per-connection polling.
             last_id = 0
             terminal = {"completed", "failed", "cancelled"}
-            # LLM calls think for minutes with zero events; without a heartbeat
-            # proxies/browsers silently kill the idle SSE connection and the
-            # UI freezes. Comments ("src/app.js reads nothing") keep it alive.
-            # No explicit disconnect polling: it blocks on idle streams under
-            # the test transport, and real servers cancel the generator on
-            # client hangup anyway.
-            last_activity = asyncio.get_event_loop().time()
-            while True:
-                events = await asyncio.to_thread(db.events_since, task_id, last_id)
-                for ev in events:
-                    last_id = ev["id"]
-                    data = json.dumps(
-                        {"id": ev["id"], "type": ev["type"], **ev["payload"]},
-                        ensure_ascii=False,
-                    )
-                    yield f"id: {ev['id']}\ndata: {data}\n\n"
-                    last_activity = asyncio.get_event_loop().time()
-                    if ev["type"] == "status" and ev["payload"].get("status") in terminal:
-                        return
-                now = asyncio.get_event_loop().time()
-                if now - last_activity >= SSE_HEARTBEAT_SECONDS:
-                    yield ": keep-alive\n\n"
-                    last_activity = now
-                await asyncio.sleep(0.6)
+
+            async def stream_body():
+                nonlocal last_id
+                queue = await bus.subscribe(task_id)
+                try:
+                    while True:
+                        events = await asyncio.to_thread(db.events_since, task_id, last_id)
+                        for ev in events:
+                            if ev["id"] <= last_id:
+                                continue
+                            last_id = ev["id"]
+                            data = json.dumps(
+                                {"id": ev["id"], "type": ev["type"], **ev["payload"]},
+                                ensure_ascii=False,
+                            )
+                            yield f"id: {ev['id']}\ndata: {data}\n\n"
+                            if ev["type"] == "status" and ev["payload"].get("status") in terminal:
+                                return
+                        # 实时段：等总线事件，空闲时发心跳防断连
+                        try:
+                            ev = await asyncio.wait_for(queue.get(), timeout=SSE_HEARTBEAT_SECONDS)
+                        except asyncio.TimeoutError:
+                            yield ": keep-alive\n\n"
+                            continue
+                        if ev["id"] <= last_id:
+                            continue
+                        last_id = ev["id"]
+                        data = json.dumps(
+                            {"id": ev["id"], "type": ev["type"], **ev["payload"]},
+                            ensure_ascii=False,
+                        )
+                        yield f"id: {ev['id']}\ndata: {data}\n\n"
+                        if ev["type"] == "status" and ev["payload"].get("status") in terminal:
+                            return
+                finally:
+                    bus.unsubscribe(task_id, queue)
+
+            async for chunk in stream_body():
+                yield chunk
 
         return StreamingResponse(
             stream(),

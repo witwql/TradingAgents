@@ -29,7 +29,7 @@ import contextlib
 import io
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated
 
 import pandas as pd
@@ -322,6 +322,51 @@ def _parse_period(value) -> pd.Timestamp | None:
         return pd.to_datetime(str(value), errors="coerce")
     except Exception:
         return None
+
+
+def get_global_news_sina(
+    curr_date: Annotated[str, "current date YYYY-MM-DD"],
+    look_back_days: Annotated[int, "days to look back"] = None,
+    limit: Annotated[int, "max headlines"] = None,
+) -> str:
+    """全球财经快讯（新浪，免限流）——新闻链的东财兜底。"""
+    from .yfinance_news import _in_news_window
+
+    config = get_config()
+    if look_back_days is None:
+        look_back_days = config["global_news_lookback_days"]
+    if limit is None:
+        limit = config["global_news_article_limit"]
+
+    start_dt = datetime.strptime(curr_date, "%Y-%m-%d") - timedelta(days=look_back_days)
+    end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+
+    raw = _quiet(ak.stock_info_global_sina)
+    if raw is None or raw.empty:
+        return f"No global news found between {start_dt:%Y-%m-%d} and {curr_date}"
+
+    news_str = ""
+    kept = 0
+    for _, row in raw.iterrows():
+        pub = None
+        with contextlib.suppress(ValueError, TypeError):
+            pub = datetime.strptime(str(row.get("时间", ""))[:19], "%Y-%m-%d %H:%M:%S")
+        if not _in_news_window(pub, start_dt, end_dt):
+            continue
+        content = str(row.get("内容", "") or "").strip()
+        if not content:
+            continue
+        news_str += f"### {content.splitlines()[0][:80]} (source: 新浪财经)\n{content}\n\n"
+        kept += 1
+        if kept >= limit:
+            break
+
+    if kept == 0:
+        return f"No global news found between {start_dt:%Y-%m-%d} and {curr_date}"
+    header = (
+        f"## Global Market News (Sina), from {start_dt:%Y-%m-%d} to {curr_date}:\n\n"
+    )
+    return header + news_str
 
 
 def get_income_statement_sina(ticker, freq="quarterly", curr_date=None) -> str:

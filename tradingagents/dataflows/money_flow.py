@@ -9,6 +9,7 @@ AKSHARE_LOCK (py-mini-racer safety) with bounded retry/backoff.
 
 import logging
 import os
+import time
 
 import pandas as pd
 
@@ -28,6 +29,10 @@ except ImportError:
 
 _RETRIES = 3
 _BASE_DELAY = 2.0
+
+# EM 连续失败后的冷却窗口：期间 fetch 直接走 THS 兜底，避免 120 次候选拖死筛选。
+_EM_COOLDOWN_SECONDS = 600
+_em_fail_until = 0.0
 
 
 def _quiet(fn, *args, retries=_RETRIES, **kwargs):
@@ -54,6 +59,47 @@ def _quiet(fn, *args, retries=_RETRIES, **kwargs):
                 time.sleep(delay)
     assert last is not None
     raise last
+
+
+def reset_em_cooldown() -> None:
+    """Clear the EM cooldown (tests and manual retries)."""
+    global _em_fail_until
+    _em_fail_until = 0.0
+
+
+def _ths_snapshot_frame(bare: str) -> pd.DataFrame | None:
+    """THS 全市场即时资金流 → 单行框架（仅当日，无历史）。"""
+    try:
+        spot = _quiet(ak.stock_fund_flow_individual, symbol="即时", retries=1)
+    except Exception as exc:
+        logger.warning("THS flow snapshot unavailable: %s", exc)
+        return None
+    if spot is None or spot.empty:
+        return None
+    row = spot[spot["股票代码"].astype(str) == bare]
+    if row.empty:
+        return None
+    row = row.iloc[0]
+
+    def parse_yi(v):
+        s = str(v).replace("亿", "").strip()
+        try:
+            return float(s) * 1e8
+        except ValueError:
+            return None
+
+    net = parse_yi(row.get("净额"))
+    turnover = parse_yi(row.get("成交额"))
+    pct = round(net / turnover * 100, 2) if (net is not None and turnover) else None
+    today = pd.Timestamp.today().normalize()
+    return pd.DataFrame([{
+        "日期": today.date(),
+        "主力净流入-净额": net,
+        "主力净流入-净占比": pct,
+        "超大单净流入-净额": None,
+        "收盘价": pd.to_numeric(row.get("最新价"), errors="coerce"),
+        "_source": "ths_snapshot",
+    }])
 
 
 def fetch_money_flow(symbol: str, curr_date: str, lookback_days: int = 40,
@@ -85,12 +131,26 @@ def fetch_money_flow(symbol: str, curr_date: str, lookback_days: int = 40,
         if not cached.empty:
             raw = cached
 
+    global _em_fail_until
+
     if raw is None:
-        raw = _quiet(ak.stock_individual_fund_flow, stock=bare, market=market,
-                     retries=retries)
-        if raw is None or raw.empty:
-            raise NoMarketDataError(symbol, bare, "no money-flow rows returned")
-        raw.to_csv(cache_file, index=False, encoding="utf-8")
+        em_blocked = time.time() < _em_fail_until
+        if not em_blocked:
+            try:
+                raw = _quiet(ak.stock_individual_fund_flow, stock=bare, market=market,
+                             retries=retries)
+            except Exception as exc:
+                # 探测性失败：进入冷却，本次与后续调用立即走兜底。
+                _em_fail_until = time.time() + _EM_COOLDOWN_SECONDS
+                logger.warning("EM money flow unavailable (%s); cooling down "
+                               "%ss, falling back to THS snapshot", exc,
+                               _EM_COOLDOWN_SECONDS)
+        if raw is None or getattr(raw, "empty", True):
+            raw = _ths_snapshot_frame(bare)
+            if raw is None or raw.empty:
+                raise NoMarketDataError(symbol, bare, "no money-flow rows returned")
+            # 兜底数据只有当日快照：仍写缓存（键含日期，天然隔离）
+            raw.to_csv(cache_file, index=False, encoding="utf-8")
 
     out = raw.copy()
     out["_d"] = pd.to_datetime(out["日期"], errors="coerce")
@@ -101,4 +161,4 @@ def fetch_money_flow(symbol: str, curr_date: str, lookback_days: int = 40,
     return out.sort_values("_d").reset_index(drop=True)
 
 
-__all__ = ["fetch_money_flow"]
+__all__ = ["fetch_money_flow", "reset_em_cooldown"]
