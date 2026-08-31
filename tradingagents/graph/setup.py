@@ -4,6 +4,7 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
+from langgraph.types import RetryPolicy, default_retry_on
 
 from tradingagents.agents import (
     create_aggressive_debator,
@@ -25,6 +26,20 @@ from tradingagents.agents.utils.agent_states import AgentState
 
 from .analyst_execution import build_analyst_execution_plan
 from .conditional_logic import ConditionalLogic
+
+# LLM nodes get a bounded retry so a transient provider hiccup (connection
+# reset, 5xx, throttling burst) costs seconds instead of the whole
+# multi-minute run. Deterministic failures must not spin: 4xx API errors
+# (bad key, context overflow) fail immediately via _llm_retry_on, logic bugs
+# fail per default_retry_on — both surface instead of burning attempts.
+def _llm_retry_on(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and 400 <= status < 500:
+        return False
+    return default_retry_on(exc)
+
+
+_LLM_RETRY = RetryPolicy(max_attempts=3, initial_interval=1.0, retry_on=_llm_retry_on)
 
 # Every target a shared conditional router can return. Each edge driven by the
 # router maps all of them, so a fall-through return (e.g. under prompt/i18n/
@@ -98,19 +113,20 @@ class GraphSetup:
 
         # Add analyst nodes to the graph
         for spec in plan.specs:
-            workflow.add_node(spec.agent_node, analyst_factories[spec.key]())
+            workflow.add_node(spec.agent_node, analyst_factories[spec.key](),
+                              retry_policy=_LLM_RETRY)
             workflow.add_node(spec.clear_node, create_msg_delete())
             workflow.add_node(spec.tool_node, self.tool_nodes[spec.key])
 
         # Add other nodes
-        workflow.add_node("Bull Researcher", bull_researcher_node)
-        workflow.add_node("Bear Researcher", bear_researcher_node)
-        workflow.add_node("Research Manager", research_manager_node)
-        workflow.add_node("Trader", trader_node)
-        workflow.add_node("Aggressive Analyst", aggressive_analyst)
-        workflow.add_node("Neutral Analyst", neutral_analyst)
-        workflow.add_node("Conservative Analyst", conservative_analyst)
-        workflow.add_node("Portfolio Manager", portfolio_manager_node)
+        workflow.add_node("Bull Researcher", bull_researcher_node, retry_policy=_LLM_RETRY)
+        workflow.add_node("Bear Researcher", bear_researcher_node, retry_policy=_LLM_RETRY)
+        workflow.add_node("Research Manager", research_manager_node, retry_policy=_LLM_RETRY)
+        workflow.add_node("Trader", trader_node, retry_policy=_LLM_RETRY)
+        workflow.add_node("Aggressive Analyst", aggressive_analyst, retry_policy=_LLM_RETRY)
+        workflow.add_node("Neutral Analyst", neutral_analyst, retry_policy=_LLM_RETRY)
+        workflow.add_node("Conservative Analyst", conservative_analyst, retry_policy=_LLM_RETRY)
+        workflow.add_node("Portfolio Manager", portfolio_manager_node, retry_policy=_LLM_RETRY)
 
         # Define edges
         # Start with the first analyst

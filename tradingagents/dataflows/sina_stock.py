@@ -44,7 +44,7 @@ from .stockstats_utils import (
     _needs_same_day_refresh,
 )
 from .symbol_utils import ashare_exchange, is_fund_symbol, normalize_symbol
-from .utils import prune_superseded_cache_files, safe_ticker_component
+from .utils import atomic_csv_write, prune_superseded_cache_files, safe_ticker_component
 from .y_finance import INDICATOR_DESCRIPTIONS
 
 logger = logging.getLogger(__name__)
@@ -164,7 +164,7 @@ def fetch_daily_ohlcv_sina(
         data = _normalize_frame(raw, symbol, canonical)
         if data.empty or "Close" not in data.columns:
             raise NoMarketDataError(symbol, canonical, f"sina returned no rows for {scode}")
-        data.to_csv(data_file, index=False, encoding="utf-8")
+        atomic_csv_write(data, data_file, index=False, encoding="utf-8")
         # The filename embeds today's date, so each day mints a new 5-year
         # file; superseded siblings for this ticker are dead weight.
         prune_superseded_cache_files(
@@ -355,7 +355,7 @@ def _fetch_statement_raw(scode: str, cn_kind: str) -> pd.DataFrame:
         if "报告日" not in df.columns:
             raise NoMarketDataError(scode, scode, f"sina {cn_kind} missing 报告日")
         os.makedirs(cache_dir, exist_ok=True)
-        df.to_csv(cache_file, index=False, encoding="utf-8")
+        atomic_csv_write(df, cache_file, index=False, encoding="utf-8")
         prune_superseded_cache_files(
             cache_file,
             os.path.join(cache_dir, f"{key}-Sina-stmt-{cn_kind}-*.csv"),

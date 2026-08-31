@@ -483,3 +483,49 @@ class TestEventBus:
         assert '"status": "completed"' in body
         # 终态后流必须自然关闭（不含心跳挂起）
         assert body.count("data:") == len(db.events_since(tid, 0))
+
+
+@pytest.mark.unit
+class TestParallelWorkers:
+    def test_two_workers_run_concurrently(self, db):
+        """The whole point of scoped configs: two runners in flight at once.
+
+        Each fake run waits on a 2-party barrier; with a single worker the
+        barrier would time out and the task would fail.
+        """
+        import threading
+
+        barrier = threading.Barrier(2, timeout=10)
+
+        class BarrierRunner(FakeRunner):
+            calls = []
+            fail_tickers = set()
+
+            def __init__(self, settings):
+                super().__init__(settings)
+
+            def run(self, task, emit, db):
+                emit("node", {"node": "Trader", "stage": "trader"})
+                barrier.wait()
+                self.calls.append(("run", task["id"]))
+                return {"rating": "Hold", "summary": "", "report_dir": ""}
+
+        BarrierRunner.calls = []
+        q = TaskQueue(db, workers=2, runner_cls=BarrierRunner)
+        q.start()
+        try:
+            q.submit({"tickers": ["600519", "000001"], "trade_date": "2026-08-27"})
+            deadline = time.time() + 15
+            while len(BarrierRunner.calls) < 2 and time.time() < deadline:
+                time.sleep(0.1)
+            statuses = [t["status"] for t in db.list_tasks()]
+            assert statuses == ["completed", "completed"]
+        finally:
+            q.stop()
+
+    def test_worker_env_override(self, db, monkeypatch):
+        monkeypatch.setenv("TRADINGAGENTS_QUEUE_WORKERS", "3")
+        q = TaskQueue(db)
+        assert q.workers == 3
+        monkeypatch.setenv("TRADINGAGENTS_QUEUE_WORKERS", "bogus")
+        assert TaskQueue(db).workers == 2  # falls back to the default

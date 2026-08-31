@@ -70,6 +70,19 @@ Breaking changes within the 0.x line are called out explicitly.
   ROE is now ×12/months with the metric relabeled `ROE(年化)`.
 
 ### Changed
+- **Task queue runs analyses in parallel** (2 workers by default,
+  `TRADINGAGENTS_QUEUE_WORKERS` to tune). Made safe by making `set_config`
+  scope-aware — inside a `config_scope` it updates the scoped view only, so
+  concurrent runners no longer mutate the process-global config (the CLI
+  global path is unchanged). Shared resources gained their own guards for
+  concurrency: a process-wide lock around the memory log's read-modify-write,
+  and atomic (temp-file + rename) cache CSV writes so a parallel reader never
+  sees a torn file.
+- **LLM nodes retry transient failures.** Every analyst/researcher/debater/
+  manager node carries a LangGraph RetryPolicy (3 attempts, 1s initial
+  backoff) covering connection errors and 5xx responses; 4xx API errors
+  (bad key, context overflow) and logic bugs fail immediately instead of
+  burning attempts. A provider hiccup now costs seconds, not the whole run.
 - **选股复盘 (pick review) closes the loop on screener picks.** New dashboard
   page settles each run's picks against realized prices: T+1/T+5 closes from
   one 前复权 OHLCV series (split/dividend-adjusted by construction), with

@@ -1,13 +1,20 @@
 """Background task queue driving TradingAgents analyses.
 
-A fixed pool of worker threads (default 1 — the pipeline is LLM- and
-data-endpoint-bound, and ``set_config`` mutates process-global state, so
-parallelism beyond one runner trades correctness for little speed) claims
-FIFO tasks, runs them through :class:`server.runner.AnalysisRunner`, streams
-progress into the events table (SSE consumers poll it), and records outcomes.
+A fixed pool of worker threads (default 2, env-overridable via
+``TRADINGAGENTS_QUEUE_WORKERS``) claims FIFO tasks and runs them through
+:class:`server.runner.AnalysisRunner`, streaming progress into the events
+table (SSE consumers poll it) and recording outcomes.
+
+Parallelism is safe because every runner builds its config and executes
+inside ``config_scope`` — ``set_config`` inside a scope only touches the
+scoped view, so concurrent runs never see each other's vendors. The truly
+process-global resources (akshare/py-mini_racer calls, the memory log,
+cache-file writes) carry their own locks; the LLM API is the real
+bottleneck, so more than ~4 workers rarely helps.
 """
 
 import logging
+import os
 import threading
 import time
 
@@ -16,13 +23,15 @@ from .runner import ALL_ANALYST_KEYS, build_stages, format_exception
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_WORKERS = 2
+
 
 class TaskQueue:
     def __init__(
         self,
         db: Database,
         settings: dict[str, str] | None = None,
-        workers: int = 1,
+        workers: int | None = None,
         runner_cls=None,
         bus=None,
     ):
@@ -30,6 +39,12 @@ class TaskQueue:
 
         self.db = db
         self.settings = settings or {}
+        if workers is None:
+            try:
+                workers = int(os.environ.get("TRADINGAGENTS_QUEUE_WORKERS", DEFAULT_WORKERS))
+            except ValueError:
+                workers = DEFAULT_WORKERS
+            workers = max(1, int(workers))
         self.workers = max(0, int(workers))
         self.runner_cls = runner_cls or AnalysisRunner
         self.bus = bus

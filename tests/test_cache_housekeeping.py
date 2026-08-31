@@ -125,3 +125,32 @@ class TestStaleCacheJanitorTests:
 
     def test_missing_dir_is_noop(self, tmp_path):
         assert prune_stale_cache_files(tmp_path / "nope") == 0
+
+
+@pytest.mark.unit
+class TestAtomicWriteTests:
+    def test_replaces_target_and_leaves_no_temp(self, tmp_path):
+        import pandas as pd
+
+        from tradingagents.dataflows.utils import atomic_csv_write
+
+        target = tmp_path / "f.csv"
+        target.write_text("old\n")
+        atomic_csv_write(pd.DataFrame({"a": [1, 2]}), target, index=False)
+        assert target.read_text().strip().splitlines()[0] == "a"
+        assert list(tmp_path.glob("*.tmp*")) == []
+
+    def test_failed_write_keeps_old_file(self, tmp_path):
+        from tradingagents.dataflows.utils import atomic_csv_write
+
+        target = tmp_path / "f.csv"
+        target.write_text("old\n")
+
+        class Boom:
+            def to_csv(self, *a, **k):
+                raise OSError("disk full")
+
+        with pytest.raises(OSError):
+            atomic_csv_write(Boom(), target, index=False)
+        assert target.read_text() == "old\n"
+        assert list(tmp_path.glob("*.tmp*")) == []

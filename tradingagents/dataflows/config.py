@@ -46,18 +46,32 @@ def initialize_config():
 def set_config(config: dict):
     """Update the configuration with custom values.
 
+    Scope-aware: when called inside a ``config_scope`` (the dashboard's
+    per-run path), updates apply to the scoped view only and the process
+    global stays untouched — this is what makes parallel task workers safe.
+    Outside any scope (CLI, programmatic use) the global is updated, exactly
+    as before.
+
     Dict-valued keys (e.g. ``data_vendors``) are merged one level deep so a
     partial update like ``{"data_vendors": {"core_stock_apis": "alpha_vantage"}}``
     keeps the other nested keys from the default; scalar keys are replaced.
     """
+    incoming = deepcopy(config)
+    scoped = _scope.get()
+    if scoped is not None:
+        _merge_into(scoped, incoming)
+        return
     global _config
     initialize_config()
-    incoming = deepcopy(config)
+    _merge_into(_config, incoming)
+
+
+def _merge_into(target: dict, incoming: dict) -> None:
     for key, value in incoming.items():
-        if isinstance(value, dict) and isinstance(_config.get(key), dict):
-            _config[key].update(value)
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            target[key].update(value)
         else:
-            _config[key] = value
+            target[key] = value
 
 
 def get_config() -> dict:

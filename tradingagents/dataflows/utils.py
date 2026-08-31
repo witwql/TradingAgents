@@ -1,7 +1,9 @@
+import contextlib
 import glob
 import logging
 import os
 import re
+import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -96,6 +98,24 @@ def get_next_weekday(date):
 # (~250 stocks/day of screening adds tens of GB a year). Write-time pruning
 # keeps the hot set at one file per (ticker, vendor); the mtime janitor at
 # server startup reclaims files for tickers no longer being analyzed.
+
+
+def atomic_csv_write(df: "pd.DataFrame", path: str | Path, **to_csv_kwargs) -> None:
+    """Write a cache CSV atomically: temp file in the same dir, then rename.
+
+    Parallel task workers (and the screener threads) can read a cache file
+    while another writer is mid-``to_csv`` — a torn read would surface as a
+    truncated frame and spurious staleness failures. ``os.replace`` is atomic
+    on the same filesystem, so readers see either the old or the new file.
+    """
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        df.to_csv(tmp, **to_csv_kwargs)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
 
 
 def prune_superseded_cache_files(current_path: str | Path, pattern: str) -> int:

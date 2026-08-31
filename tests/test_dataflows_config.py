@@ -6,7 +6,7 @@ import unittest
 import pytest
 
 import tradingagents.default_config as default_config
-from tradingagents.dataflows.config import get_config, set_config
+from tradingagents.dataflows.config import config_scope, get_config, set_config
 
 
 @pytest.mark.unit
@@ -59,3 +59,45 @@ class DataflowsConfigIsolationTests(unittest.TestCase):
         fresh = get_config()
         self.assertEqual(fresh["tool_vendors"]["get_stock_data"], "alpha_vantage")
         self.assertEqual(fresh["tool_vendors"]["get_news"], "alpha_vantage")
+
+
+@pytest.mark.unit
+class ScopeAwareSetConfigTests(unittest.TestCase):
+    """set_config inside a config_scope must not leak to the process global —
+
+    this is the property that makes parallel dashboard task workers safe."""
+
+    def setUp(self):
+        set_config(copy.deepcopy(default_config.DEFAULT_CONFIG))
+
+    def test_outside_scope_still_updates_global(self):
+        set_config({"llm_provider": "google"})
+        assert get_config()["llm_provider"] == "google"
+        set_config(copy.deepcopy(default_config.DEFAULT_CONFIG))
+
+    def test_inside_scope_global_untouched(self):
+        with config_scope({"llm_provider": "glm-cn", "temperature": 0.3}):
+            set_config({"llm_provider": "deepseek"})
+            # scoped view sees the update
+            assert get_config()["llm_provider"] == "deepseek"
+        # global keeps its pre-scope value
+        assert get_config()["llm_provider"] == default_config.DEFAULT_CONFIG["llm_provider"]
+
+    def test_nested_dict_merge_applies_to_scope_only(self):
+        vendors = copy.deepcopy(default_config.DEFAULT_CONFIG["data_vendors"])
+        set_config({"data_vendors": vendors})
+        scoped_vendors = dict(vendors)
+        scoped_vendors["news_data"] = "akshare"
+        with config_scope({"data_vendors": scoped_vendors}):
+            set_config({"data_vendors": {"news_data": "sina"}})
+            assert get_config()["data_vendors"]["news_data"] == "sina"
+        assert get_config()["data_vendors"]["news_data"] == "yfinance"
+
+    def test_two_scopes_isolated(self):
+        with config_scope({"llm_provider": "glm-cn"}):
+            set_config({"temperature": 0.1})
+            inner = get_config()
+        complete = copy.deepcopy(default_config.DEFAULT_CONFIG)
+        with config_scope(complete):
+            assert get_config()["temperature"] is None
+        assert inner["temperature"] == 0.1

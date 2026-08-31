@@ -869,3 +869,35 @@ class TestLegacyRemoval:
         assert len(entries) == 1
         assert entries[0]["ticker"] == "NVDA"
         assert entries[0]["pending"] is True
+
+
+@pytest.mark.unit
+class TestConcurrentAppendSafety:
+    def test_parallel_workers_append_cleanly(self, tmp_path):
+        """Two parallel task workers share one log file; appends must never
+        interleave and every entry must stay parseable."""
+        import threading
+
+        path = tmp_path / "memory.md"
+        log_a = TradingMemoryLog({"memory_log_path": str(path)})
+        log_b = TradingMemoryLog({"memory_log_path": str(path)})
+
+        def worker(log, prefix, n=25):
+            for i in range(n):
+                log.store_decision(f"{prefix}{i:03d}", "2026-08-27", f"决策 {prefix}{i}")
+
+        threads = [threading.Thread(target=worker, args=(log_a, "AAA")),
+                   threading.Thread(target=worker, args=(log_b, "BBB"))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        entries = log_a.load_entries()
+        assert len(entries) == 50
+        expected = {f"{p}{i:03d}" for p in ("AAA", "BBB") for i in range(25)}
+        assert {e["ticker"] for e in entries} == expected
+        assert all(e["pending"] and e["decision"].startswith("决策 ") for e in entries)
+        # every tag line intact — no torn writes mid-entry
+        raw = path.read_text(encoding="utf-8")
+        assert raw.count("[2026-08-27 |") == 50

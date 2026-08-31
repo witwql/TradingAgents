@@ -150,7 +150,9 @@ def fetch_money_flow(symbol: str, curr_date: str, lookback_days: int = 40,
             if raw is None or raw.empty:
                 raise NoMarketDataError(symbol, bare, "no money-flow rows returned")
             # 兜底数据只有当日快照：仍写缓存（键含日期，天然隔离）
-            raw.to_csv(cache_file, index=False, encoding="utf-8")
+            from .utils import atomic_csv_write
+
+            atomic_csv_write(raw, cache_file, index=False, encoding="utf-8")
 
     out = raw.copy()
     out["_d"] = pd.to_datetime(out["日期"], errors="coerce")
