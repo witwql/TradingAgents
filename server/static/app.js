@@ -41,7 +41,7 @@ function buildNav() {
   $("#nav").innerHTML = VIEWS.map((v) =>
     `<a href="#${v}" data-view="${v}">${{
       dashboard: "工作台", new: "新建分析", tasks: "任务队列",
-      reports: "报告中心", favorites: "自选股", settings: "设置",
+      picks: "明日精选", reports: "报告中心", favorites: "自选股", settings: "设置",
     }[v]}</a>`).join("");
 }
 
