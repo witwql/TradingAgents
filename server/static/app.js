@@ -569,7 +569,7 @@ async function quickAnalyze(code) {
 async function loadSettings() {
   const [settings, health] = await Promise.all([api("/settings"), api("/health")]);
   $("#s-region").value = settings.glm_region || "glm-cn";
-  $("#s-deep").value = settings.deep_model || settings.glm_model || "glm-5.2";
+  $("#s-deep").value = settings.deep_model || settings.glm_model || "glm-5.3-flash";
   $("#s-quick").value = settings.quick_model || "";
   $("#s-temp").value = settings.temperature || "";
   const hasKey = settings.glm_region === "glm" ? health.has_zhipu_intl_key : health.has_zhipu_cn_key;

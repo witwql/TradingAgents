@@ -150,7 +150,7 @@ def _sina_code(bare: str) -> str:
 _SETTING_KEYS = {
     "glm_region": ("glm-cn", {"glm-cn", "glm"}),
     "auto_screen_time": ("15:30", None),   # 每交易日自动筛选 HH:MM；"off" 关闭
-    "glm_model": ("glm-5.2", None),
+    "glm_model": ("glm-5.3-flash", None),
     "quick_model": (None, None),
     "deep_model": (None, None),
     "temperature": (None, None),

@@ -77,10 +77,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # the oldest resolved entries are pruned once this limit is exceeded.
     # Pending entries are never pruned. None disables rotation entirely.
     "memory_log_max_entries": None,
-    # LLM settings
-    "llm_provider": "openai",
-    "deep_think_llm": "gpt-5.5",
-    "quick_think_llm": "gpt-5.4-mini",
+    # LLM settings. GLM via Zhipu BigModel (open.bigmodel.cn, ZHIPU_CN_API_KEY)
+    # is the project default; the international Z.AI endpoint is provider "glm"
+    # with ZHIPU_API_KEY. Switch via TRADINGAGENTS_LLM_PROVIDER /
+    # TRADINGAGENTS_DEEP_THINK_LLM / TRADINGAGENTS_QUICK_THINK_LLM.
+    "llm_provider": "glm-cn",
+    "deep_think_llm": "glm-5.3-flash",
+    "quick_think_llm": "glm-5.3-flash",
     # When None, each provider's client falls back to its own default endpoint
     # (api.openai.com for OpenAI, generativelanguage.googleapis.com for Gemini, ...).
     # The CLI overrides this per provider when the user picks one. Keeping a

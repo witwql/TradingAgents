@@ -97,7 +97,7 @@ class AnalysisRunner:
         # GLM LLM (Zhipu). Region switchable: glm-cn uses ZHIPU_CN_API_KEY at
         # open.bigmodel.cn; glm (international) uses ZHIPU_API_KEY at api.z.ai.
         config["llm_provider"] = self.settings.get("glm_region", "glm-cn")
-        default_model = self.settings.get("glm_model", "glm-5.2")
+        default_model = self.settings.get("glm_model", "glm-5.3-flash")
         config["deep_think_llm"] = self.settings.get("deep_model", default_model)
         config["quick_think_llm"] = self.settings.get("quick_model", default_model)
         if temp := self.settings.get("temperature"):

@@ -35,7 +35,7 @@ PROVIDER_DEFAULTS = {
     "anthropic": ("claude-sonnet-4-6", None),
     "deepseek": ("deepseek-v4-flash", None),
     "qwen": ("qwen3.7-plus", None),
-    "glm": ("glm-5", None),
+    "glm": ("glm-5.3-flash", None),
     "xai": ("grok-4.3", None),
 }
 
