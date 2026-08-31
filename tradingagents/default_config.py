@@ -130,11 +130,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # The configured value is the exact vendor chain — requests are NOT silently
     # routed to vendors you didn't choose. For ordered fallback, list several,
     # e.g. "yfinance,alpha_vantage". "default" uses all available vendors.
-    # For China A-shares the dashboard preset leads with the unthrottled Sina
-    # hosts and keeps EastMoney/Yahoo as declared fallbacks:
-    #   {"core_stock_apis": "sina,akshare,yfinance",
-    #    "technical_indicators": "sina,akshare,yfinance",
-    #    "fundamental_data": "sina,akshare,yfinance",
+    # For China A-shares the dashboard preset uses only unthrottled hosts for
+    # prices/fundamentals (Sina first, Yahoo fallback); EastMoney is kept ONLY
+    # for news (its search-api host is on different infra from the throttled
+    # quote endpoints). Money flow degrades to a THS snapshot when EM is down.
+    #   {"core_stock_apis": "sina,yfinance",
+    #    "technical_indicators": "sina,yfinance",
+    #    "fundamental_data": "sina,yfinance",
     #    "news_data": "akshare,yfinance"}
     # (akshare serves A-shares via EastMoney/THS, pip install
     # "tradingagents[akshare]", no API key)

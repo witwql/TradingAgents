@@ -382,9 +382,10 @@ class TestSinaSpotParsing:
 
         task = {"ticker": "600519.SS", "trade_date": "2026-08-27", "asset_type": "stock"}
         cfg = AnalysisRunner({})._build_config(task)
-        assert cfg["data_vendors"]["core_stock_apis"].startswith("sina")
-        assert cfg["data_vendors"]["technical_indicators"].startswith("sina")
-        assert "akshare" in cfg["data_vendors"]["fundamental_data"]
+        assert cfg["data_vendors"]["core_stock_apis"] == "sina,yfinance"
+        assert cfg["data_vendors"]["technical_indicators"] == "sina,yfinance"
+        assert "akshare" not in cfg["data_vendors"]["fundamental_data"]
+        assert cfg["data_vendors"]["news_data"] == "akshare,yfinance"
 
 
 class TestRetrospectiveFixes:

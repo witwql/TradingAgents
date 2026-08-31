@@ -107,20 +107,20 @@ class AnalysisRunner:
         config["max_debate_rounds"] = max(1, int(task.get("debate_rounds", 1)))
         config["max_risk_discuss_rounds"] = max(1, int(task.get("risk_rounds", 1)))
 
-        # A-share data preset. Sina hosts stayed unthrottled under heavy load,
-        # so OHLCV/indicators/fundamentals lead with sina; EastMoney stays in
-        # the chain for its richer enrichment (disclosure-date anti-lookahead
-        # statements, valuation history, insider changes), Yahoo last. News
-        # keeps akshare first (EM search API sits on a different host family
-        # from the throttled quote endpoints).
+        # A-share data preset. EastMoney's push2his quote host is throttled
+        # under load; the Sina and Yahoo Finance hosts are stable, so they
+        # are the only members of the price/fundamentals chains. EastMoney's
+        # *news* host (search-api) sits on different infrastructure and has
+        # been reliable, so the news chain keeps akshare first. Money flow
+        # (EM-only history) degrades to a THS snapshot fallback under throttle.
         if task.get("asset_type", "stock") == "stock" and _looks_like_ashare(
             task["ticker"]
         ):
             config["data_vendors"] = {
-                "core_stock_apis": "sina,akshare,yfinance",
-                "technical_indicators": "sina,akshare,yfinance",
-                "fundamental_data": "sina,akshare,yfinance",
-                "news_data": "akshare,sina,yfinance",
+                "core_stock_apis": "sina,yfinance",
+                "technical_indicators": "sina,yfinance",
+                "fundamental_data": "sina,yfinance",
+                "news_data": "akshare,yfinance",
                 "macro_data": "fred",
                 "prediction_markets": "polymarket",
             }
