@@ -88,6 +88,24 @@ CREATE TABLE IF NOT EXISTS screen_runs (
     results TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS pick_returns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_type TEXT NOT NULL,             -- 'screen' (动量) | 'value' (价值)
+    run_id TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    code TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    pick_price REAL,                    -- selection-time spot price
+    baseline_price REAL,                -- OHLCV close on trade_date
+    score REAL,                         -- momentum probability / value score
+    rank INTEGER,
+    ret_1d REAL,
+    ret_5d REAL,
+    settled_at REAL,                    -- ts of last settlement attempt
+    UNIQUE(run_type, run_id, code)
+);
+CREATE INDEX IF NOT EXISTS idx_pick_returns_run ON pick_returns(run_type, run_id);
 """
 
 
@@ -389,6 +407,47 @@ class Database:
         self.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value)
         )
+
+    # -- pick returns (选股复盘) ----------------------------------------------
+    def upsert_pick_return(self, row: dict) -> None:
+        """Insert or refresh one pick's settlement row (keyed by run+code)."""
+        self.execute(
+            "INSERT INTO pick_returns (run_type, run_id, trade_date, code, name,"
+            " pick_price, baseline_price, score, rank, ret_1d, ret_5d, settled_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(run_type, run_id, code) DO UPDATE SET"
+            " name=excluded.name, pick_price=excluded.pick_price,"
+            " baseline_price=COALESCE(excluded.baseline_price, baseline_price),"
+            " score=excluded.score,"
+            " rank=excluded.rank,"
+            " ret_1d=COALESCE(excluded.ret_1d, ret_1d),"
+            " ret_5d=COALESCE(excluded.ret_5d, ret_5d),"
+            " settled_at=excluded.settled_at",
+            (
+                row["run_type"], row["run_id"], row["trade_date"], row["code"],
+                row.get("name", ""), row.get("pick_price"), row.get("baseline_price"),
+                row.get("score"), row.get("rank"), row.get("ret_1d"),
+                row.get("ret_5d"), row.get("settled_at"),
+            ),
+        )
+
+    def get_pick_returns(self, run_type: str, run_id: str) -> list[dict]:
+        return self.fetchall(
+            "SELECT * FROM pick_returns WHERE run_type=? AND run_id=?"
+            " ORDER BY rank, code",
+            (run_type, run_id),
+        )
+
+    def pick_return_run_stats(self) -> dict[tuple[str, str], dict]:
+        """(run_type, run_id) → settlement aggregates for the review list."""
+        rows = self.fetchall(
+            "SELECT run_type, run_id, COUNT(*) AS n,"
+            " SUM(ret_1d IS NOT NULL) AS settled_1d, AVG(ret_1d) AS avg_1d,"
+            " SUM(ret_5d IS NOT NULL) AS settled_5d, AVG(ret_5d) AS avg_5d,"
+            " SUM(CASE WHEN ret_5d > 0 THEN 1 ELSE 0 END) AS wins_5d"
+            " FROM pick_returns GROUP BY run_type, run_id"
+        )
+        return {(r["run_type"], r["run_id"]): r for r in rows}
 
 
 def default_db_path() -> str:

@@ -70,6 +70,13 @@ Breaking changes within the 0.x line are called out explicitly.
   ROE is now ×12/months with the metric relabeled `ROE(年化)`.
 
 ### Changed
+- **选股复盘 (pick review) closes the loop on screener picks.** New dashboard
+  page settles each run's picks against realized prices: T+1/T+5 closes from
+  one 前复权 OHLCV series (split/dividend-adjusted by construction), with
+  per-run mean return and hit rate. Settlement is lazy and terminal-once —
+  the summary list is read-only, opening a run fetches only unsettled picks
+  through the cached vendor chain, and settled rows never refetch. Backed by
+  a new `pick_returns` table (unique per run+code, COALESCE updates).
 - **Data cache is now self-cleaning.** Per-day OHLCV windows minted a new
   multi-MB file per (ticker, day) forever — ~250 stocks/day of screening
   added tens of GB a year. Writes now supersede the same (ticker, vendor)'s

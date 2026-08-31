@@ -27,7 +27,7 @@ const STAGE_TEXT = {
 const state = { filterStatus: "", drawerTaskId: null, drawerES: null, cache: {}, feedCount: 0, feedScroll: true, lastScreenRun: null, lastValueRun: null };
 
 /* ---------------- router ---------------- */
-const VIEWS = ["dashboard", "new", "tasks", "picks", "reports", "favorites", "settings"];
+const VIEWS = ["dashboard", "new", "tasks", "picks", "review", "reports", "favorites", "settings"];
 function route() {
   const name = (location.hash || "#dashboard").slice(1) || "dashboard";
   const target = VIEWS.includes(name) ? name : "dashboard";
@@ -41,7 +41,7 @@ function buildNav() {
   $("#nav").innerHTML = VIEWS.map((v) =>
     `<a href="#${v}" data-view="${v}">${{
       dashboard: "工作台", new: "新建分析", tasks: "任务队列",
-      picks: "明日精选", reports: "报告中心", favorites: "自选股", settings: "设置",
+      picks: "明日精选", review: "选股复盘", reports: "报告中心", favorites: "自选股", settings: "设置",
     }[v]}</a>`).join("");
 }
 
@@ -662,7 +662,7 @@ function fmtTime(ts) {
 function loadView(name) {
   try {
     ({ dashboard: loadDashboard, new: buildAnalystPicker, tasks: loadTasks,
-       picks: loadPicks, reports: loadReports, favorites: loadFavorites,
+       picks: loadPicks, review: loadReview, reports: loadReports, favorites: loadFavorites,
        settings: loadSettings }[name] || (() => {}) )();
   } catch (e) {
     console.error(`view ${name} failed:`, e);
@@ -868,6 +868,86 @@ function valuePickCard(p, idx, muted = false) {
     <div class="prob-bar"><i style="width:${pct}%"></i></div>
     <div class="factor-chips">${chips}</div>
   </div>`;
+}
+
+/* ---------------- 选股复盘 ---------------- */
+
+async function loadReview() {
+  try {
+    const { runs } = await api("/review/summary");
+    renderReviewList(runs);
+  } catch (e) {
+    $("#review-list").innerHTML =
+      `<div class="task-empty" style="border-color:var(--red)">复盘数据加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderReviewList(runs) {
+  if (!runs.length) {
+    $("#review-list").innerHTML =
+      `<div class="task-empty">还没有筛选记录 —— 去「明日精选」跑一次筛选，次日起这里就能看到 picks 的实际表现</div>`;
+    return;
+  }
+  const rows = runs.map((r) => {
+    const settled = (r.settled_5d ?? 0) > 0;
+    const badge = r.label === "动量精选"
+      ? `<span class="vs-metric good">${esc(r.label)}</span>`
+      : `<span class="vs-metric warn">${esc(r.label)}</span>`;
+    const stat = settled
+      ? `均 T+5 <b class="${pctTrend(r.avg_5d)}">${fmtPct((r.avg_5d ?? 0) * 100)}</b>` +
+        ` · 命中 ${Math.round((r.hit_rate_5d ?? 0) * 100)}%`
+      : `<span class="muted">未结算（点击结算）</span>`;
+    return `<tr style="cursor:pointer" onclick="openReviewRun('${r.run_type}','${r.run_id}')">
+      <td>${badge}</td><td>${esc(r.trade_date)}</td>
+      <td>${r.n_picks ?? 0} 只</td>
+      <td>${stat}</td>
+      <td class="muted">${new Date(r.created_at * 1000).toLocaleString()}</td>
+      <td class="muted">${r.status === "done" ? "已完成" : esc(r.status)}</td>
+    </tr>`;
+  }).join("");
+  $("#review-list").innerHTML = `
+    <table><thead><tr><th>来源</th><th>筛选日</th><th>入选</th><th>事后表现</th><th>运行时间</th><th>状态</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+async function openReviewRun(runType, runId) {
+  const box = $("#review-detail");
+  box.innerHTML = `<div class="task-empty"><span class="spinner"></span> 结算中（首次会拉取行情，约几秒）…</div>`;
+  try {
+    const detail = await api(`/review/${runType}/${runId}`);
+    renderReviewDetail(detail);
+  } catch (e) {
+    box.innerHTML = `<div class="task-empty" style="border-color:var(--red)">结算失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderReviewDetail(detail) {
+  const picks = detail.picks || [];
+  if (!picks.length) {
+    $("#review-detail").innerHTML = `<div class="task-empty">该次运行没有可复盘的 picks</div>`;
+    return;
+  }
+  const cell = (v) => v == null
+    ? `<span class="muted">—</span>`
+    : `<span class="${pctTrend(v * 100)}">${fmtPct(v * 100)}</span>`;
+  const rows = picks.map((p) => `
+    <tr>
+      <td>${p.rank ?? ""}</td>
+      <td><b>${esc(p.code)}</b></td>
+      <td>${esc(p.name || "")}</td>
+      <td>${p.score ?? ""}</td>
+      <td>${p.pick_price != null ? "¥" + p.pick_price.toFixed(2) : "—"}</td>
+      <td>${p.baseline_price != null ? "¥" + p.baseline_price.toFixed(2) : "—"}</td>
+      <td>${cell(p.ret_1d)}</td>
+      <td>${cell(p.ret_5d)}</td>
+      <td><button class="btn small" onclick="event.stopPropagation();deepResearch('${p.code}')">🔬</button></td>
+    </tr>`).join("");
+  $("#review-detail").innerHTML = `
+    <div class="card" style="margin-top:14px">
+      <h3>${esc(detail.run_type === "screen" ? "动量精选" : "价值精选")} · ${esc(detail.trade_date || "")} 明细</h3>
+      <table><thead><tr><th>#</th><th>代码</th><th>名称</th><th>入选分</th><th>入选价</th><th>基准收盘</th><th>T+1</th><th>T+5</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    </div>`;
 }
 
 /* ---------------- 明日精选 ---------------- */

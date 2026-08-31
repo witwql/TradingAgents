@@ -500,6 +500,24 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
 
         return {"runs": history(db, limit=min(limit, 50))}
 
+    # ----------------------------------------------------------------- review
+    @app.get("/api/review/summary")
+    def review_list():
+        """Recent screener runs with settled-return aggregates (read-only)."""
+        from .review import review_summary
+
+        return {"runs": review_summary(db)}
+
+    @app.get("/api/review/{run_type}/{run_id}")
+    def review_detail(run_type: str, run_id: str):
+        """Settle one run's picks lazily (fetch only unsettled) and return rows."""
+        from .review import settle_run
+
+        try:
+            return settle_run(db, run_type, run_id)
+        except ValueError:
+            raise HTTPException(404, "unknown run type")
+
     @app.get("/api/screen/latest")
     def screen_latest():
         from .screener import latest_run
