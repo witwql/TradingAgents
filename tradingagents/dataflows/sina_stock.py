@@ -491,6 +491,59 @@ def compute_ttm_eps(ratios: "pd.DataFrame") -> float | None:
     return latest_eps
 
 
+def compute_ttm_net_profit(scode: str) -> float | None:
+    """TTM 归母净利润 from Sina income statement (primary data, not EPS).
+
+    Sina's financial-analysis-indicator EPS can be wrong when share counts
+    change (e.g. placements); net profit is always correct. The TTM formula:
+    latest cumulative + prev annual - prev same-period (same as EPS TTM
+    but applied to the net-profit column).
+    """
+    raw = _quiet(ak.stock_financial_report_sina, stock=scode, symbol="利润表")
+    if raw is None or raw.empty or "报告日" not in raw.columns:
+        return None
+
+    np_col = next(
+        (c for c in raw.columns
+         if "归属于母公司" in str(c) and "净利润" in str(c)), None)
+    if np_col is None:
+        return None
+
+    df = raw.copy()
+    df["_period"] = pd.to_datetime(df["报告日"], format="%Y%m%d", errors="coerce")
+    df["_np"] = pd.to_numeric(df[np_col], errors="coerce")
+    df = df[df["_period"].notna() & df["_np"].notna()].sort_values("_period", ascending=False)
+    if df.empty:
+        return None
+
+    latest = df.iloc[0]
+    latest_month = latest["_period"].month
+
+    if latest_month == 12:
+        return float(latest["_np"])
+
+    prev_year = latest["_period"].year - 1
+    annual_np = None
+    same_np = None
+    for _, row in df.iterrows():
+        d = row["_period"]
+        if d.year == prev_year and d.month == 12:
+            annual_np = row["_np"]
+        if d.year == prev_year and d.month == latest_month:
+            same_np = row["_np"]
+        if annual_np is not None and same_np is not None:
+            break
+
+    if annual_np is not None and same_np is not None:
+        return float(latest["_np"] + (annual_np - same_np))
+
+    # fallback: most recent annual
+    for _, row in df.iterrows():
+        if row["_period"].month == 12:
+            return float(row["_np"])
+    return float(latest["_np"])
+
+
 def _fund_not_applicable(label: str) -> str:
     return _FUND_NOTE_TMPL.format(label=label)
 
@@ -568,11 +621,22 @@ def get_fundamentals_sina(
                 v = r.get(cn)
                 if v is not None and pd.notna(v) and v != 0:
                     lines.append(f"{en}: {v}")
-            # PE-TTM: price / trailing-twelve-month EPS (matches broker apps)
-            ttm_eps = compute_ttm_eps(ratios)
-            if ttm_eps and ttm_eps > 0 and not data.empty:
-                pe_ttm = float(data["Close"].iloc[-1]) / ttm_eps
-                lines.append(f"PE-TTM (price/TTM EPS): {pe_ttm:.1f}")
+            # PE-TTM: 总市值 / TTM归母净利润 (matches broker apps)
+            # 新浪EPS可能因股本变动失真 → 直接用利润表+市值
+            sc = f"sh{acode}" if acode.startswith("6") else f"sz{acode}"
+            ttm_np = compute_ttm_net_profit(sc)
+            if ttm_np and ttm_np > 0:
+                mc_for_pe = None
+                try:
+                    mc_df2 = _quiet(ak.stock_zh_valuation_baidu, symbol=acode,
+                                     indicator="总市值", period="近一年")
+                    if mc_df2 is not None and not mc_df2.empty:
+                        mc_for_pe = float(pd.to_numeric(mc_df2["value"], errors="coerce").iloc[-1])
+                except Exception:
+                    pass
+                if mc_for_pe:
+                    pe_ttm_val = mc_for_pe * 1e8 / ttm_np
+                    lines.append(f"PE-TTM (总市值/TTM净利润): {pe_ttm_val:.1f}")
     except Exception as exc:
         logger.warning("sina financial indicators unavailable: %s", exc)
 

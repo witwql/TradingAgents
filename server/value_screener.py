@@ -149,14 +149,11 @@ def evaluate_value_stock(code: str, name: str, price: float, curr_date: str) -> 
     if roe_metric.get("score", 0) == 0 and (roe_metric.get("value", 0) or 0) < 5:
         return None
 
-    from tradingagents.dataflows.sina_stock import compute_ttm_eps
-
-    ttm_eps = compute_ttm_eps(ratios)
-    pe_est = float(price) / ttm_eps if ttm_eps and ttm_eps > 0 else None
 
     # Phase 2: Baidu PB + market cap (only for survivors, ~0.5s)
     pb = None
     mktcap = None
+    ttm_np = None
     try:
         pb_df = _quiet(ak.stock_zh_valuation_baidu, symbol=code,
                        indicator="市净率", period="近一年")
@@ -170,14 +167,29 @@ def evaluate_value_stock(code: str, name: str, price: float, curr_date: str) -> 
     except Exception as exc:
         logger.debug("value screener: %s baidu unavailable: %s", code, exc)
 
-    pb_score = _score_pb(pb)
-    pe_score = _score_pe(pe_est)
-    total_score = quick_score + pb_score + pe_score
+    # Sina income statement TTM net profit → PE-TTM (matches broker apps)
+    try:
+        from tradingagents.dataflows.sina_stock import compute_ttm_net_profit
 
+        ttm_np = compute_ttm_net_profit(code)
+    except Exception as exc:
+        logger.debug("value screener: %s income TTM unavailable: %s", code, exc)
+
+    pe_ttm = None
+    if mktcap and ttm_np and ttm_np > 0:
+        # mktcap is in 亿元; ttm_np in 元 → convert
+        pe_ttm = mktcap * 1e8 / ttm_np
+
+    pb_score = _score_pb(pb)
+
+
+    pe_score = _score_pe(pe_ttm)
     metrics["PB"] = {"value": round(pb, 2) if pb else None, "score": pb_score}
-    metrics["PE"] = {"value": round(pe_est, 1) if pe_est else None, "score": pe_score}
+    metrics["PE-TTM"] = {"value": round(pe_ttm, 1) if pe_ttm else None, "score": pe_score}
     if mktcap:
         metrics["总市值"] = {"value": round(mktcap, 0), "score": 0}
+
+    total_score = quick_score + pb_score + pe_score
 
     return {
         "code": code,
