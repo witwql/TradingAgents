@@ -446,58 +446,18 @@ _FUND_NOTE_TMPL = (
 )
 
 
-def compute_ttm_eps(ratios: "pd.DataFrame") -> float | None:
-    """从新浪财务分析指标表计算 TTM（滚动 12 个月）EPS。
-
-    新浪的摊薄每股收益是累计值（Q1=3个月, H1=6个月, Q3=9个月, 年报=12个月）。
-    TTM = 最新累计 + 去年全年 - 去年同期累计。
-    若数据不全则退化为最近年报 EPS（静态 PE 口径）。
-    """
-    if ratios is None or ratios.empty:
-        return None
-    by_date = ratios.sort_values("日期", ascending=False).reset_index(drop=True)
-    latest = by_date.iloc[0]
-    latest_month = pd.to_datetime(latest["日期"]).month
-
-    def _eps(row):
-        v = row.get("摊薄每股收益(元)")
-        return float(v) if v is not None and pd.notna(v) else None
-
-    latest_eps = _eps(latest)
-    if latest_eps is None:
-        return None
-
-    # 年报直接用
-    if latest_month == 12:
-        return latest_eps
-
-    # 找去年年报 + 去年同期
-    prev_year = pd.to_datetime(latest["日期"]).year - 1
-    annual = None
-    same_period = None
-    for _, row in by_date.iterrows():
-        d = pd.to_datetime(row["日期"])
-        if d.year == prev_year and d.month == 12:
-            annual = _eps(row)
-        if d.year == prev_year and d.month == latest_month:
-            same_period = _eps(row)
-    if annual is not None and same_period is not None:
-        return latest_eps + (annual - same_period)
-
-    # 退化为最近年报 EPS
-    for _, row in by_date.iterrows():
-        if pd.to_datetime(row["日期"]).month == 12:
-            return _eps(row)
-    return latest_eps
-
-
-def compute_ttm_net_profit(scode: str) -> float | None:
+def compute_ttm_net_profit(scode: str, curr_date: str | None = None) -> float | None:
     """TTM 归母净利润 from Sina income statement (primary data, not EPS).
 
     Sina's financial-analysis-indicator EPS can be wrong when share counts
     change (e.g. placements); net profit is always correct. The TTM formula:
     latest cumulative + prev annual - prev same-period (same as EPS TTM
     but applied to the net-profit column).
+
+    ``curr_date`` gates look-ahead in backtests: rows whose report period is
+    after the analysis date are excluded (Sina exposes no disclosure date, so
+    period-end gating applies — same documented tradeoff as the statement
+    renderer).
     """
     raw = _quiet(ak.stock_financial_report_sina, stock=scode, symbol="利润表")
     if raw is None or raw.empty or "报告日" not in raw.columns:
@@ -512,7 +472,12 @@ def compute_ttm_net_profit(scode: str) -> float | None:
     df = raw.copy()
     df["_period"] = pd.to_datetime(df["报告日"], format="%Y%m%d", errors="coerce")
     df["_np"] = pd.to_numeric(df[np_col], errors="coerce")
-    df = df[df["_period"].notna() & df["_np"].notna()].sort_values("_period", ascending=False)
+    df = df[df["_period"].notna() & df["_np"].notna()]
+    if curr_date:
+        df = df[df["_period"] <= pd.Timestamp(curr_date)]
+    if df.empty:
+        return None
+    df = df.sort_values("_period", ascending=False)
     if df.empty:
         return None
 
@@ -553,7 +518,8 @@ def get_fundamentals_sina(
     curr_date: Annotated[str, "current date YYYY-MM-DD"] = None,
 ) -> str:
     """Best-effort fundamentals from Sina + Baidu: price, daily market-cap/PB,
-    quarterly financial ratios (ROE, margins, debt, EPS, BVPS)."""
+    quarterly financial ratios (ROE, margins, debt, BVPS) and valuation
+    (PE-TTM / EPS-TTM) derived from market cap and TTM net profit."""
     canonical = normalize_symbol(ticker)
     acode = to_acode(ticker)
     if is_fund_symbol(acode):
@@ -584,6 +550,7 @@ def get_fundamentals_sina(
         raise NoMarketDataError(ticker, canonical, "no daily rows")
 
     # Baidu daily valuation (total market cap + PB, non-EM host)
+    mc_last = None  # latest 总市值 in 亿
     try:
         mktcap = _quiet(ak.stock_zh_valuation_baidu, symbol=acode,
                        indicator="总市值", period="近一年")
@@ -592,7 +559,8 @@ def get_fundamentals_sina(
         if mktcap is not None and not mktcap.empty:
             mc = pd.to_numeric(mktcap["value"], errors="coerce").dropna()
             if len(mc):
-                lines.append(f"Total Market Cap (亿): {mc.iloc[-1]:.0f}")
+                mc_last = float(mc.iloc[-1])
+                lines.append(f"Total Market Cap (亿): {mc_last:.0f}")
                 if len(mc) >= 6:
                     lines.append(f"Market Cap 5d Change: "
                                  f"{(mc.iloc[-1]/mc.iloc[-6]-1)*100:+.1f}%")
@@ -603,16 +571,25 @@ def get_fundamentals_sina(
     except Exception as exc:
         logger.warning("baidu valuation unavailable: %s", exc)
 
-    # Sina quarterly financial ratios (EPS, BVPS, ROE, margins, debt)
+    # Sina quarterly financial ratios (BVPS, ROE, margins, debt)
     try:
         yr = str((pd.Timestamp(curr_date) if curr_date
                   else pd.Timestamp.today()).year - 1)
         ratios = _quiet(ak.stock_financial_analysis_indicator,
                         symbol=acode, start_year=yr)
         if ratios is not None and not ratios.empty:
-            r = ratios.iloc[-1]
-            for cn, en in [("摊薄每股收益(元)", "EPS (diluted)"),
-                           ("每股净资产_调整前(元)", "Book Value Per Share"),
+            # Look-ahead gate: Sina exposes no disclosure date, so gate on the
+            # report-period end — the same documented tradeoff as the statement
+            # renderer. Without this, the latest row can be a period disclosed
+            # after the analysis date.
+            ratio_dt = pd.to_datetime(ratios["日期"], errors="coerce")
+            cutoff = pd.Timestamp(curr_date) if curr_date else pd.Timestamp.max
+            visible = ratios[ratio_dt.notna() & (ratio_dt <= cutoff)].copy()
+            if visible.empty:
+                raise ValueError(f"no ratio rows on or before {curr_date}")
+            visible["_dt"] = pd.to_datetime(visible["日期"], errors="coerce")
+            r = visible.sort_values("_dt").iloc[-1]
+            for cn, en in [("每股净资产_调整前(元)", "Book Value Per Share"),
                            ("净资产收益率(%)", "ROE"),
                            ("销售净利率(%)", "Net Profit Margin"),
                            ("资产负债率(%)", "Debt to Asset Ratio"),
@@ -621,22 +598,29 @@ def get_fundamentals_sina(
                 v = r.get(cn)
                 if v is not None and pd.notna(v) and v != 0:
                     lines.append(f"{en}: {v}")
-            # PE-TTM: 总市值 / TTM归母净利润 (matches broker apps)
-            # 新浪EPS可能因股本变动失真 → 直接用利润表+市值
-            sc = f"sh{acode}" if acode.startswith("6") else f"sz{acode}"
-            ttm_np = compute_ttm_net_profit(sc)
-            if ttm_np and ttm_np > 0:
-                mc_for_pe = None
-                try:
-                    mc_df2 = _quiet(ak.stock_zh_valuation_baidu, symbol=acode,
-                                     indicator="总市值", period="近一年")
-                    if mc_df2 is not None and not mc_df2.empty:
-                        mc_for_pe = float(pd.to_numeric(mc_df2["value"], errors="coerce").iloc[-1])
-                except Exception:
-                    pass
-                if mc_for_pe:
-                    pe_ttm_val = mc_for_pe * 1e8 / ttm_np
-                    lines.append(f"PE-TTM (总市值/TTM净利润): {pe_ttm_val:.1f}")
+            lines.append(
+                f"(Sina ratios are for cumulative reporting period "
+                f"{r['_dt'].date()}: ROE and margins are year-to-date figures, "
+                "NOT annualized; growth rates are same-period YoY)"
+            )
+
+        # Valuation from PRIMARY data only. Sina's 摊薄每股收益 is deliberately
+        # NOT emitted: it embeds a stale share count (after a placement it is
+        # silently too high — 002466 showed 4.06 vs a true ~2.8) and is a
+        # cumulative-period figure besides. Both PE-TTM and EPS-TTM derive
+        # from Baidu total market cap + Sina income-statement TTM net profit.
+        sc = f"sh{acode}" if acode.startswith("6") else f"sz{acode}"
+        ttm_np = compute_ttm_net_profit(sc, curr_date)
+        if ttm_np is not None and ttm_np <= 0:
+            lines.append("PE-TTM: N/A (TTM net profit is negative)")
+        elif ttm_np and mc_last:
+            lines.append(f"PE-TTM (总市值/TTM净利润): {mc_last * 1e8 / ttm_np:.1f}")
+            latest_close = float(data["Close"].iloc[-1])
+            shares = mc_last * 1e8 / latest_close
+            if shares > 0:
+                lines.append(
+                    f"EPS (TTM, TTM净利润/当前总股本): {ttm_np / shares:.2f}"
+                )
     except Exception as exc:
         logger.warning("sina financial indicators unavailable: %s", exc)
 

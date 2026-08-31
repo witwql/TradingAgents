@@ -134,19 +134,39 @@ def evaluate_value_stock(code: str, name: str, price: float, curr_date: str) -> 
     if ratios is None or ratios.empty:
         return None
 
-    r = ratios.iloc[-1]
+    # Look-ahead gate: only report periods on/before the screening date (the
+    # Sina table reflects what is published *now*, so a backtest run would
+    # otherwise score on figures disclosed after curr_date).
+    ratio_dt = pd.to_datetime(ratios["日期"], errors="coerce")
+    cutoff = pd.Timestamp(curr_date) if curr_date else pd.Timestamp.max
+    ratios = ratios[ratio_dt.notna() & (ratio_dt <= cutoff)]
+    if ratios.empty:
+        return None
+
+    r = (ratios.assign(_dt=pd.to_datetime(ratios["日期"], errors="coerce"))
+         .sort_values("_dt").iloc[-1])
+    period_month = r["_dt"].month
+
     metrics = {}
     quick_score = 0
+    roe_annualized = None
     for cn, en, score_fn in _RATIO_FIELDS:
         v = r.get(cn)
         if v is not None and pd.notna(v):
-            s = score_fn(float(v))
-            metrics[en] = {"value": round(float(v), 2), "score": s}
+            val = float(v)
+            if cn == "净资产收益率(%)":
+                # Sina's ROE is cumulative year-to-date (H1 = 6-month return).
+                # Annualize so the thresholds mean the same thing in February
+                # as in December, and label it so the UI stays honest.
+                val = val * 12.0 / period_month
+                en = "ROE(年化)"
+                roe_annualized = val
+            s = score_fn(val)
+            metrics[en] = {"value": round(val, 2), "score": s}
             quick_score += s
 
-    # Quick gate: ROE > 5% AND no catastrophic metrics → proceed to Baidu
-    roe_metric = metrics.get("ROE", {})
-    if roe_metric.get("score", 0) == 0 and (roe_metric.get("value", 0) or 0) < 5:
+    # Quick gate: ROE > 5% (annualized) AND no catastrophic metrics → proceed
+    if roe_annualized is None or roe_annualized < 5:
         return None
 
 
@@ -167,11 +187,13 @@ def evaluate_value_stock(code: str, name: str, price: float, curr_date: str) -> 
     except Exception as exc:
         logger.debug("value screener: %s baidu unavailable: %s", code, exc)
 
-    # Sina income statement TTM net profit → PE-TTM (matches broker apps)
+    # Sina income statement TTM net profit → PE-TTM (matches broker apps).
+    # curr_date gates look-ahead: backtest runs must not see periods
+    # disclosed after the screening date.
     try:
         from tradingagents.dataflows.sina_stock import compute_ttm_net_profit
 
-        ttm_np = compute_ttm_net_profit(code)
+        ttm_np = compute_ttm_net_profit(code, curr_date)
     except Exception as exc:
         logger.debug("value screener: %s income TTM unavailable: %s", code, exc)
 

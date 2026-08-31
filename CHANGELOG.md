@@ -51,7 +51,30 @@ Breaking changes within the 0.x line are called out explicitly.
   live backend, exposing runtime errors API tests cannot see; a new
   frontend-consistency test guards against silent HTML/JS drift.
 
+- **Valuation no longer trusts Sina's financial-analysis-indicator EPS.**
+  That column embeds a stale share count (after a placement it is silently
+  too high — 002466 showed 4.06 vs a true ~2.7) and is a cumulative-period
+  figure besides, yet it was still emitted as `EPS (diluted)` in
+  `get_fundamentals_sina` output. Both PE-TTM and EPS-TTM now derive only
+  from primary data: Baidu total market cap ÷ latest close → current shares,
+  combined with income-statement TTM net profit (`compute_ttm_net_profit`).
+  A negative TTM renders `PE-TTM: N/A` instead of vanishing silently.
+- **Sina-sourced figures are look-ahead gated by `curr_date`.** The
+  financial-ratio row and TTM net profit took the latest row of tables that
+  reflect what is published *now*, so backtest runs scored on figures
+  disclosed after the analysis date; both now filter rows to periods on or
+  before `curr_date` (same period-end tradeoff as the statement renderer).
+- **Value screener annualizes interim-period ROE.** Sina's 净资产收益率 is
+  cumulative year-to-date, so a stock whose latest report is an H1 scored
+  against annual thresholds (20/12/8) and was systematically under-scored;
+  ROE is now ×12/months with the metric relabeled `ROE(年化)`.
+
 ### Changed
+- **Default LLM is GLM-5.3-Flash via Zhipu BigModel** (`glm-cn`,
+  `ZHIPU_CN_API_KEY`) for both deep and quick think; the dashboard default
+  model, CLI catalog and smoke-script preset follow. Switch back per provider
+  via `TRADINGAGENTS_LLM_PROVIDER` / `TRADINGAGENTS_DEEP_THINK_LLM` /
+  `TRADINGAGENTS_QUICK_THINK_LLM`.
 - `load_ohlcv` and the verified snapshot follow the configured vendor chain
   (previously hardwired to yfinance).
 - Runner configs are scoped per run (`config_scope`) instead of mutating

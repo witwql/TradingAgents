@@ -123,6 +123,104 @@ class TestStatementTests:
 
 
 @pytest.mark.unit
+class TestFundamentalsValuationTests:
+    """Valuation must come from primary data (market cap / TTM net profit),
+    never from Sina's financial-analysis-indicator EPS, whose share-count
+    denominator goes stale after placements (002466: 4.06 vs true ~2.7)."""
+
+    def _daily(self, end="2026-08-31"):
+        end_ts = pd.Timestamp(end)
+        days = [end_ts - pd.Timedelta(days=1), end_ts]
+        return pd.DataFrame({
+            "date": [d.strftime("%Y-%m-%d") for d in days],
+            "open": [10.0, 10.5], "high": [11.0, 11.5],
+            "low": [9.5, 10.0], "close": [10.5, 11.0],
+            "volume": [1e5, 1e5],
+        })
+
+    def _ratio_row(self, period, eps, roe):
+        return {"日期": pd.Timestamp(period), "摊薄每股收益(元)": eps,
+                "每股净资产_调整前(元)": 5.0, "净资产收益率(%)": roe,
+                "销售净利率(%)": 20.0, "资产负债率(%)": 40.0,
+                "净利润增长率(%)": 30.0, "流动比率": 2.0}
+
+    def _ratios(self):
+        # Q1'26 and H1'26 rows; the H1 row is "the future" for curr_date in Q1
+        return pd.DataFrame([
+            self._ratio_row("2026-03-31", 1.0, 5.0),
+            self._ratio_row("2026-06-30", 4.06, 8.77),
+        ])
+
+    def _income(self):
+        return pd.DataFrame([
+            {"报告日": "20260630", "归属于母公司所有者的净利润": 30e8},
+            {"报告日": "20260331", "归属于母公司所有者的净利润": 10e8},
+            {"报告日": "20251231", "归属于母公司所有者的净利润": 40e8},
+            {"报告日": "20250630", "归属于母公司所有者的净利润": 15e8},
+            {"报告日": "20250331", "归属于母公司所有者的净利润": 8e8},
+        ])
+
+    def _baidu(self, *args, **kwargs):
+        return pd.DataFrame({"value": [858.0]})
+
+    def _fundamentals(self, curr_date, ratios=None, daily_end="2026-08-31"):
+        cache = tempfile.mkdtemp()
+        fake = mock.Mock()
+        fake.stock_zh_a_daily.return_value = self._daily(daily_end)
+        fake.stock_financial_analysis_indicator.return_value = (
+            self._ratios() if ratios is None else ratios)
+        fake.stock_financial_report_sina.return_value = self._income()
+        fake.stock_zh_valuation_baidu.side_effect = self._baidu
+        with mock.patch.object(sina, "ak", fake), _cache_ctx(cache):
+            return sina.get_fundamentals_sina("600519.SS", curr_date=curr_date)
+
+    def test_no_stale_share_count_eps(self):
+        out = self._fundamentals("2026-08-31")
+        assert "EPS (diluted)" not in out
+        assert "4.06" not in out                      # stale-share column value
+        assert "EPS (TTM" in out
+        # shares = 858亿 / 11.0 → EPS-TTM = TTM净利 55亿 / 78亿股 = 0.71
+        assert "EPS (TTM, TTM净利润/当前总股本): 0.71" in out
+        # PE-TTM = 858e8 / 55e8 = 15.6
+        assert "PE-TTM (总市值/TTM净利润): 15.6" in out
+
+    def test_ratio_row_gated_by_curr_date(self):
+        out = self._fundamentals("2026-03-31", daily_end="2026-03-31")
+        assert "2026-06-30" not in out                # H1 row must not leak
+        assert "2026-03-31" in out                    # Q1 row is the visible one
+
+    def test_ratio_period_label_present(self):
+        out = self._fundamentals("2026-08-31")
+        assert "NOT annualized" in out
+        assert "cumulative reporting period 2026-06-30" in out
+
+    def test_negative_ttm_says_na(self):
+        income = pd.DataFrame([
+            {"报告日": "20260630", "归属于母公司所有者的净利润": -5e8},
+            {"报告日": "20251231", "归属于母公司所有者的净利润": -20e8},
+            {"报告日": "20250630", "归属于母公司所有者的净利润": -8e8},
+        ])
+        cache = tempfile.mkdtemp()
+        fake = mock.Mock()
+        fake.stock_zh_a_daily.return_value = self._daily()
+        fake.stock_financial_analysis_indicator.return_value = self._ratios()
+        fake.stock_financial_report_sina.return_value = income
+        fake.stock_zh_valuation_baidu.side_effect = self._baidu
+        with mock.patch.object(sina, "ak", fake), _cache_ctx(cache):
+            out = sina.get_fundamentals_sina("600519.SS", curr_date="2026-08-31")
+        assert "PE-TTM: N/A (TTM net profit is negative)" in out
+
+    def test_ttm_net_profit_curr_date_gate(self):
+        fake = mock.Mock()
+        fake.stock_financial_report_sina.return_value = self._income()
+        with mock.patch.object(sina, "ak", fake):
+            # as of 2026-07-01 only H1'26 visible: TTM = 30 + 40 - 15 = 55亿
+            assert sina.compute_ttm_net_profit("sh600519", "2026-07-01") == 55e8
+            # as of 2026-04-01 only Q1'26 visible: TTM = 10 + 40 - 8 = 42亿
+            assert sina.compute_ttm_net_profit("sh600519", "2026-04-01") == 42e8
+
+
+@pytest.mark.unit
 class TestRouterRegistrationTests:
     def test_sina_registered_everywhere_expected(self):
         for method in ("get_stock_data", "get_indicators", "get_fundamentals",
