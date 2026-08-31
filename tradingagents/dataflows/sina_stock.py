@@ -454,7 +454,8 @@ def get_fundamentals_sina(
     ticker: Annotated[str, "ticker symbol of the company"],
     curr_date: Annotated[str, "current date YYYY-MM-DD"] = None,
 ) -> str:
-    """Best-effort fundamentals from Sina only: price summary + latest P&L."""
+    """Best-effort fundamentals from Sina + Baidu: price, daily market-cap/PB,
+    quarterly financial ratios (ROE, margins, debt, EPS, BVPS)."""
     canonical = normalize_symbol(ticker)
     acode = to_acode(ticker)
     if is_fund_symbol(acode):
@@ -476,7 +477,7 @@ def get_fundamentals_sina(
         prev_close = float(data["Close"].iloc[-2]) if len(data) >= 2 else None
         lines.append(f"Latest Close ({latest['Date'].date()}): {latest['Close']}")
         if prev_close:
-            chg = (float(latest['Close']) - prev_close) / prev_close * 100
+            chg = (float(latest["Close"]) - prev_close) / prev_close * 100
             lines.append(f"Latest Daily Change: {chg:+.2f}%")
         if len(data) >= 21:
             ma20 = float(data["Close"].tail(20).mean())
@@ -484,25 +485,55 @@ def get_fundamentals_sina(
     else:
         raise NoMarketDataError(ticker, canonical, "no daily rows")
 
+    # Baidu daily valuation (total market cap + PB, non-EM host)
     try:
-        income = _fetch_statement_raw(to_sina_symbol(ticker), _STATEMENT_KINDS["income_statement"][0])
-        income["_period"] = income["报告日"].map(_parse_period)
-        cutoff = pd.Timestamp(curr_date) if curr_date else pd.Timestamp.max
-        recent = income[income["_period"].notna() & (income["_period"] <= cutoff)].tail(4)
-        for _, row in recent.iloc[::-1].iterrows():
-            rev_col = next((c for c in income.columns if "营业总收入" in str(c)), None)
-            np_col = next((c for c in income.columns
-                           if "归属于母公司所有者的净利润" in str(c) or "归属母公司" in str(c)), None)
-            if rev_col and pd.notna(row[rev_col]):
-                lines.append(f"Revenue({row['_period'].date()}): {row[rev_col]}")
-            if np_col and pd.notna(row[np_col]):
-                lines.append(f"Parent Net Profit({row['_period'].date()}): {row[np_col]}")
+        mktcap = _quiet(ak.stock_zh_valuation_baidu, symbol=acode,
+                       indicator="总市值", period="近一年")
+        pb = _quiet(ak.stock_zh_valuation_baidu, symbol=acode,
+                    indicator="市净率", period="近一年")
+        if mktcap is not None and not mktcap.empty:
+            mc = pd.to_numeric(mktcap["value"], errors="coerce").dropna()
+            if len(mc):
+                lines.append(f"Total Market Cap (亿): {mc.iloc[-1]:.0f}")
+                if len(mc) >= 6:
+                    lines.append(f"Market Cap 5d Change: "
+                                 f"{(mc.iloc[-1]/mc.iloc[-6]-1)*100:+.1f}%")
+        if pb is not None and not pb.empty:
+            pbs = pd.to_numeric(pb["value"], errors="coerce").dropna()
+            if len(pbs):
+                lines.append(f"Price to Book (PB): {pbs.iloc[-1]:.2f}")
     except Exception as exc:
-        logger.warning("sina fundamentals: statement enrichment skipped (%s)", exc)
+        logger.warning("baidu valuation unavailable: %s", exc)
+
+    # Sina quarterly financial ratios (EPS, BVPS, ROE, margins, debt)
+    try:
+        yr = str((pd.Timestamp(curr_date) if curr_date
+                  else pd.Timestamp.today()).year - 1)
+        ratios = _quiet(ak.stock_financial_analysis_indicator,
+                        symbol=acode, start_year=yr)
+        if ratios is not None and not ratios.empty:
+            r = ratios.iloc[-1]
+            for cn, en in [("摊薄每股收益(元)", "EPS (diluted)"),
+                           ("每股净资产_调整前(元)", "Book Value Per Share"),
+                           ("净资产收益率(%)", "ROE"),
+                           ("销售净利率(%)", "Net Profit Margin"),
+                           ("资产负债率(%)", "Debt to Asset Ratio"),
+                           ("净利润增长率(%)", "Net Profit Growth YoY"),
+                           ("流动比率", "Current Ratio")]:
+                v = r.get(cn)
+                if v is not None and pd.notna(v) and v != 0:
+                    lines.append(f"{en}: {v}")
+            # PE estimate from latest price / diluted EPS
+            eps = r.get("摊薄每股收益(元)")
+            if eps is not None and pd.notna(eps) and eps > 0 and not data.empty:
+                pe_est = float(data["Close"].iloc[-1]) / float(eps)
+                lines.append(f"PE (estimated, price/EPS): {pe_est:.1f}")
+    except Exception as exc:
+        logger.warning("sina financial indicators unavailable: %s", exc)
 
     header = (
         f"# Company Fundamentals for {canonical} ({acode})\n"
-        "# Source: Sina Finance (daily summary + latest reported periods)\n"
+        "# Source: Sina + Baidu (unthrottled hosts)\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
     return header + "\n".join(lines)
