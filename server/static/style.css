@@ -317,3 +317,9 @@ h3 { font-size: 15px; margin-bottom: 10px; }
 .vs-metric.good { border-color: var(--green); color: var(--green); }
 .vs-metric.warn { border-color: var(--amber); color: var(--amber); }
 .vs-metric.bad  { border-color: var(--red); color: var(--red); }
+
+.agent-link { margin-left: 8px; }
+.agent-badge { display:inline-block; border:1px solid; border-radius:999px; padding:2px 12px; font-size:12px; text-decoration:none; cursor:pointer; }
+.agent-badge.rating-buy { border-color:var(--green); color:var(--green); }
+.agent-badge.rating-sell { border-color:var(--red); color:var(--red); }
+.agent-badge.rating-hold { border-color:var(--amber); color:var(--amber); }

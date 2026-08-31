@@ -458,6 +458,23 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
             }
         }
 
+
+    @app.get("/api/tasks/by-ticker/{ticker}")
+    def task_by_ticker(ticker: str):
+        """筛选用联动：该标的最近的已完成分析任务（评级+报告路径）。"""
+        from tradingagents.dataflows.symbol_utils import normalize_symbol
+
+        canonical = normalize_symbol(ticker)
+        row = db.fetchone(
+            "SELECT id, ticker, trade_date, status, rating, report_dir,"
+            " created_at FROM tasks WHERE ticker=? AND status='completed'"
+            " ORDER BY created_at DESC LIMIT 1",
+            (canonical,),
+        )
+        if not row:
+            return {"task": None}
+        return {"task": dict(row)}
+
     @app.get("/api/value-screen/history")
     def value_screen_history(limit: int = 10):
         from .value_screener import value_history

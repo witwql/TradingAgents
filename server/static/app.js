@@ -787,6 +787,7 @@ async function pollValueScreen() {
     html += wl.map((p, i) => valuePickCard(p, i, true)).join("");
   }
   $("#value-list").innerHTML = html;
+  enrichPicksWithAgentLinks([...(picks || []), ...(wl || [])]);
   if (sawRunning) {
     showToast(`价值筛选完成：入榜 ${picks.length} 只`, picks.length ? `最高 ${picks[0].score}/16 分` : "");
     setTimeout(() => $("#value-list").scrollIntoView({ behavior: "smooth", block: "start" }), 150);
@@ -823,6 +824,24 @@ async function renderValueHistory() {
       <td>${h.universe ?? "—"}</td><td>${h.evaluated ?? "—"}</td>
       <td>${h.qualifying ?? "—"}</td>
       <td>${h.top_score != null ? h.top_score + "/16" : "—"}</td></tr>`).join("") + `</table>`;
+}
+
+async function enrichPicksWithAgentLinks(picks) {
+  for (const p of picks) {
+    try {
+      const { task } = await api(`/tasks/by-ticker/${encodeURIComponent(p.code)}`);
+      const slot = $(`#agent-link-${p.code}`);
+      if (!slot) continue;
+      if (task && task.rating) {
+        const r = (task.rating || "").toLowerCase();
+        const cls = /buy|overweight/.test(r) ? "rating-buy" : /sell|underweight/.test(r) ? "rating-sell" : "rating-hold";
+        const label = ratingText(task.rating);
+        slot.innerHTML = `<a class="agent-badge ${cls}" href="#" title="点击查看完整报告"
+          onclick="go('#reports');setTimeout(()=>loadReports('${task.id}'),150);return false;"
+          >📋 ${esc(label)} · ${esc(task.trade_date)}</a>`;
+      }
+    } catch {}
+  }
 }
 
 function valuePickCard(p, idx, muted = false) {
@@ -991,6 +1010,7 @@ async function pollScreening() {
   html += `<h3 style="margin:16px 0 10px">👁 观察名单 Top5（未达 80%）</h3>` +
     (watchlist.map((p, i) => pickCard(p, i, true)).join("") || `<div class="muted">无</div>`);
   $("#picks-list").innerHTML = html;
+  enrichPicksWithAgentLinks([...(picks || []), ...(watchlist || [])]);
 
   if (sawRunning) {
     showToast(
