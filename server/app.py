@@ -157,6 +157,18 @@ _SETTING_KEYS = {
 }
 
 
+def _normalize_bus_event(ev: dict) -> dict:
+    """Task-event dicts come in two shapes: db.events_since rows carry
+    {'id','ts','type','payload'}; bus events should match since the emit
+    fix — but normalize either shape so publisher drift degrades to missing
+    fields, never a dead SSE stream (user-hit KeyError: 'payload')."""
+    if "payload" not in ev:
+        ev = {**ev, "payload": {
+            k: v for k, v in ev.items() if k not in ("id", "type", "ts")
+        }}
+    return ev
+
+
 def create_app(db: Database | None = None, queue: TaskQueue | None = None,
                start_spot: bool = True, args_db_path: str | None = None) -> FastAPI:
     from .events import EventBus
@@ -319,6 +331,7 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
                             continue
                         if ev["id"] <= last_id:
                             continue
+                        ev = _normalize_bus_event(ev)
                         last_id = ev["id"]
                         data = json.dumps(
                             {"id": ev["id"], "type": ev["type"], **ev["payload"]},

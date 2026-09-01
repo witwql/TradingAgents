@@ -31,6 +31,14 @@ Breaking changes within the 0.x line are called out explicitly.
   history, watchlist for near-misses.
 
 ### Fixed
+- **SSE live stream crashed with `KeyError: 'payload'`** whenever a bus
+  event won the race against the DB re-poll (every subscriber attached
+  to a running task): `queue.emit` published events flattened while the
+  handler consumed them expecting `db.events_since` row shape. Producer
+  now publishes the row shape, the handler normalizes either shape
+  (module-level `_normalize_bus_event`), and a real-HTTP live test
+  covers the race — the old TestClient-based SSE tests could never
+  reach the live path (streaming responses buffer in TestClient).
 - py-mini-racer (V8) hard-abort when akshare calls ran on multiple threads —
   all akshare invocations now serialize through a process-wide lock.
 - yfinance 429s and repeated transport aborts classify as

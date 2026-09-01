@@ -285,7 +285,10 @@ class TestThsFallback:
         monkeypatch.setattr(mf, "get_config",
                             lambda: {"data_cache_dir": __import__("tempfile").mkdtemp()})
 
-        df = mf.fetch_money_flow("600519.SS", "2026-08-31", 30, retries=1)
+        # anchor to "today" so the snapshot row (stamped Timestamp.today()
+        # inside _ths_snapshot_frame) always passes the <= curr_date filter
+        today = pd.Timestamp.today().strftime("%Y-%m-%d")
+        df = mf.fetch_money_flow("600519.SS", today, 30, retries=1)
         assert len(df) == 1
         assert df["_source"].iloc[-1] == "ths_snapshot"
         assert abs(df["主力净流入-净额"].iloc[-1] - 1.5e8) < 1
@@ -302,5 +305,6 @@ class TestThsFallback:
         monkeypatch.setattr(mf, "ak", fake)
         monkeypatch.setattr(mf, "get_config",
                             lambda: {"data_cache_dir": __import__("tempfile").mkdtemp()})
+        today = pd.Timestamp.today().strftime("%Y-%m-%d")
         with pytest.raises(NoMarketDataError):
-            mf.fetch_money_flow("600519.SS", "2026-08-31", 30, retries=1)
+            mf.fetch_money_flow("600519.SS", today, 30, retries=1)

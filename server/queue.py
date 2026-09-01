@@ -135,8 +135,10 @@ class TaskQueue:
                 return
             if self.bus is not None:
                 try:
+                    # Same shape as db.events_since rows (payload nested, not
+                    # flattened) — the SSE handler consumes both paths.
                     self.bus.publish(task_id, {
-                        "id": event_id, "type": type_, **payload,
+                        "id": event_id, "type": type_, "payload": payload,
                     })
                 except Exception:
                     logger.exception("event bus publish failed")

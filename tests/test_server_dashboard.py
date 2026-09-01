@@ -529,3 +529,95 @@ class TestParallelWorkers:
         assert q.workers == 3
         monkeypatch.setenv("TRADINGAGENTS_QUEUE_WORKERS", "bogus")
         assert TaskQueue(db).workers == 2  # falls back to the default
+
+
+@pytest.mark.unit
+class TestSSELivePath:
+    """The user-hit SSE regression: queue.emit used to publish bus events
+    flattened ({'id','type',**payload}) while the SSE handler consumed
+    them expecting the db.events_since row shape ({'payload': {...}}) —
+    a live event winning the race against the DB re-poll killed the
+    stream with KeyError('payload'). TestClient buffers streaming
+    responses (the handler finishes before the client reads), so the
+    live race is covered by a real uvicorn thread at the bottom of this
+    class; unit tests pin both ends of the contract."""
+
+    def test_emit_publishes_db_row_shape(self, db):
+        """Producer contract: bus events mirror events_since rows."""
+        captured = []
+
+        class BusStub:
+            def publish(self, topic, event):
+                captured.append(event)
+
+        q = TaskQueue(db, workers=1, runner_cls=FakeRunner, bus=BusStub())
+        (tid,) = client_submit(q, ["600519"])
+        q._execute(db.get_task(tid))
+        assert captured, "emit never reached the bus"
+        for ev in captured:
+            assert set(ev) == {"id", "type", "payload"}, f"stray keys: {ev!r}"
+        statuses = [e for e in captured if e["type"] == "status"]
+        assert statuses[-1]["payload"]["status"] == "completed"
+
+    def test_normalize_accepts_both_shapes(self):
+        from server.app import _normalize_bus_event
+
+        row = {"id": 3, "ts": 1.0, "type": "status", "payload": {"status": "completed"}}
+        assert _normalize_bus_event(row)["payload"] == {"status": "completed"}
+
+        legacy_flat = {"id": 3, "type": "status", "status": "completed"}
+        normalized = _normalize_bus_event(legacy_flat)
+        assert normalized["payload"] == {"status": "completed"}
+
+    def test_live_bus_event_over_real_http(self, db):
+        """End-to-end over real HTTP: subscriber attaches mid-run, a live
+        bus event (legacy flattened shape, direct publish — exactly what
+        the old emit did) must be delivered, not KeyError the stream."""
+        import httpx
+        import threading
+        import uvicorn
+
+        release = threading.Event()
+        started = threading.Event()
+
+        class ParkedRunner(FakeRunner):
+            def run(self, task, emit, db):
+                emit("status", {"status": "running", "ticker": task["ticker"]})
+                started.set()
+                release.wait(timeout=30)
+                return {"rating": "Buy", "summary": "", "report_dir": ""}
+
+        q = TaskQueue(db, workers=1, runner_cls=ParkedRunner)
+        app = create_app(db=db, queue=q, start_spot=False)
+        config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        deadline = time.time() + 10
+        while not server.started and time.time() < deadline:
+            time.sleep(0.05)
+        port = server.servers[0].sockets[0].getsockname()[1]
+
+        (tid,) = client_submit(q, ["600519"])
+        assert started.wait(timeout=10)
+
+        body = b""
+        published = got_live = False
+        with httpx.stream("GET", f"http://127.0.0.1:{port}/api/tasks/{tid}/events",
+                          timeout=30) as resp:
+            for chunk in resp.iter_raw():
+                body += chunk
+                if not published and b'"status": "running"' in body:
+                    published = True
+                    # legacy flattened shape, exactly what emit() did
+                    app.state.bus.publish(tid, {
+                        "id": 10 ** 6, "type": "llm_end",
+                        "node": "Trader", "text": "结论：看多",
+                    })
+                elif published and b"llm_end" in body:
+                    got_live = True
+                    break
+        release.set()
+        thread.join(timeout=5)
+        assert got_live, f"live bus event never delivered; got: {body[:400]!r}"
+        assert '"text": "结论：看多"' in body.decode()
