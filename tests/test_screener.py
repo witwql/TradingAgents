@@ -58,7 +58,7 @@ class TestFactorEngineTests:
         for col in sc.FACTOR_COLUMNS:
             d[col] = True
         prob, _, fired = sc._composite_probability(d, stats)
-        assert prob is not None and prob <= 0.95 and fired == 6
+        assert prob is not None and prob <= 0.95 and fired == len(sc.FACTOR_COLUMNS)
 
     def test_low_sample_factor_not_counted_toward_weight(self):
         d = sc.compute_factors(_hist())
@@ -68,7 +68,7 @@ class TestFactorEngineTests:
         for col in sc.FACTOR_COLUMNS:
             d[col] = True
         prob, contrib, fired = sc._composite_probability(d, stats)
-        assert fired == 6
+        assert fired == len(sc.FACTOR_COLUMNS)
         unused = [c for c in contrib if c["factor"] == sc.FACTOR_LABELS["f1_pullback"]]
         assert unused and unused[0]["used"] is False
 
@@ -416,3 +416,82 @@ class TestInterruptedSweepAndCancel:
         row = db.fetchone("SELECT status, results FROM screen_runs WHERE id=?", (run_id,))
         assert row["status"] == "cancelled"
         assert '"cancelled": true' in row["results"]
+
+
+class TestFuturesFactor:
+    """F7 相关期货利多脉冲: mapped futures day-move ≥ +1% fires the factor."""
+
+    @staticmethod
+    def _frame(n=260):
+        # Same engineered resonance as TestEvaluateStockIntegration: mild
+        # uptrend then a last-day breakout, so a composite actually forms.
+        rng = np.random.default_rng(0)
+        closes = [20.0]
+        for i in range(1, n - 1):
+            closes.append(closes[-1] * (1 + 0.001 + 0.008 * np.sin(i / 3) + rng.normal(0, 0.003)))
+        closes.append(closes[-1] * 1.025)
+        closes = np.array(closes)
+        dates = pd.bdate_range(end="2026-06-24", periods=n)
+        volumes = np.abs(rng.normal(5e6, 5e5, n))
+        volumes[-6:-1] = 1.0e6
+        volumes[-1] = 3.0e6
+        return pd.DataFrame({
+            "Date": dates.astype(str),
+            "Open": closes * 0.998, "High": closes * 1.004,
+            "Low": closes * 0.996, "Close": closes,
+            "Volume": volumes,
+        })
+
+    @staticmethod
+    def _fut(dates, closes):
+        return {"AL0": {"name": "沪铝", "kind": "domestic",
+                        "close": pd.Series(closes, index=dates),
+                        "moves": {"1d": 2.0, "5d": 3.0, "20d": 4.0}}}
+
+    def test_f7_fires_on_pulse_day_only(self):
+        d = sc.compute_factors(self._frame())
+        dates = pd.bdate_range(end="2026-06-24", periods=120)
+        closes = [100.0] * 119 + [102.0]           # +2% on the last bar only
+        out = sc.append_futures_factor(d, self._fut(dates, closes))
+        assert bool(out["f7_futures"].iloc[-1])
+        assert not bool(out["f7_futures"].iloc[-2])
+        assert not bool(out["f7_futures"].iloc[0])  # pre-history days → False
+
+    def test_f7_absent_without_snapshot(self):
+        d = sc.compute_factors(self._frame())
+        assert "f7_futures" not in sc.append_futures_factor(d, {}).columns
+        assert "f7_futures" not in sc.append_futures_factor(d, None).columns
+
+    def test_evaluate_stock_annotates_and_appends_factor(self, monkeypatch):
+        """云铝股份 + AL0 snapshot: futures_context attached, f7 in the table."""
+        frame = self._frame()
+        import tradingagents.dataflows.sina_stock as ss
+        monkeypatch.setattr(ss, "fetch_daily_ohlcv_sina", lambda *a, **k: frame)
+        # keep the money-flow leg off the network; f6 simply stays absent
+        monkeypatch.setattr("tradingagents.dataflows.money_flow.fetch_money_flow",
+                            mock.Mock(side_effect=RuntimeError("skip")))
+
+        dates = pd.to_datetime(frame["Date"])
+        closes = [100.0] * (len(dates) - 1) + [102.5]  # pulse on the last day
+        result = sc.evaluate_stock("000807", "云铝股份", 12.0, "2026-06-24",
+                                   futures=self._fut(dates, closes))
+        assert result is not None
+        assert result["futures_context"] and "沪铝" in result["futures_context"]
+        assert any(c["factor"].startswith("相关期货") for c in result["contributions"])
+        assert result["factors_available"] == 6   # 5 price factors + f7 (f6 off)
+
+    def test_evaluate_stock_without_mapping_stays_clean(self, monkeypatch):
+        frame = self._frame()
+        import tradingagents.dataflows.sina_stock as ss
+        monkeypatch.setattr(ss, "fetch_daily_ohlcv_sina", lambda *a, **k: frame)
+
+        monkeypatch.setattr("tradingagents.dataflows.money_flow.fetch_money_flow",
+                            mock.Mock(side_effect=RuntimeError("skip")))
+        dates = pd.to_datetime(frame["Date"])
+        fut = self._fut(dates, [100.0] * len(dates))
+        result = sc.evaluate_stock("600519", "贵州茅台", 12.0, "2026-06-24",
+                                   futures=fut)
+        assert result is not None
+        assert result["futures_context"] is None
+        assert not any(c["factor"].startswith("相关期货") for c in result["contributions"])
+        assert result["factors_available"] == 5   # f6/f7 never appended

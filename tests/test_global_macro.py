@@ -38,6 +38,15 @@ def _mock_ak(monkeypatch):
     monkeypatch.setattr(gm, "ak", fake)
 
 
+@pytest.fixture(autouse=True)
+def _futures_basket_isolation(monkeypatch):
+    """The snapshot cache is process-wide — reset it between tests — and a
+    missing basket symbol must fail fast (real retries sleep 2/4/8s)."""
+    monkeypatch.setattr(gm, "_QUIET_RETRIES", 0)
+    monkeypatch.setattr(gm, "_FUTURES_CACHE", {})
+    monkeypatch.setattr(gm, "_FUTURES_CACHE_TS", 0.0)
+
+
 @pytest.mark.unit
 class TestFactorTools:
     def test_gold_report_contains_moves(self, monkeypatch):
@@ -95,7 +104,7 @@ class TestExposureModel:
         with mock.patch.object(gm, "load_ohlcv", return_value=frame):
             out = gm.get_factor_exposure.func("600519.SS", "2026-06-24", lookback_days=120)
         assert "因子暴露度模型" in out
-        gold_line = next(l for l in out.splitlines() if l.startswith("| 国际金价"))
+        gold_line = next(l for l in out.splitlines() if l.startswith("| COMEX黄金"))
         corr_value = float(gold_line.split("|")[2].strip().replace("+", ""))
         assert corr_value > 0.9, gold_line
         assert "隔夜因子综合得分" in out
@@ -113,7 +122,115 @@ class TestExposureModel:
 
 
 @pytest.mark.unit
-class TestGraphWiring:
+class TestFuturesBasket:
+    """15-symbol basket: name mapping, snapshot cache, look-ahead, exposure."""
+
+    def _fake_ak(self, dates, periods=None):
+        n = periods or len(dates)
+        foreign = {
+            "GC": _daily_frame(dates[:n], [1800 + i for i in range(n)]),
+            "SI": _daily_frame(dates[:n], [30.0 + i * 0.01 for i in range(n)]),
+            "HG": _daily_frame(dates[:n], [4.0 + i * 0.001 for i in range(n)]),
+            "CL": _daily_frame(dates[:n], [70.0 - i * 0.01 for i in range(n)]),
+            "NG": _daily_frame(dates[:n], [2.5] * n),
+        }
+        domestic_dates = [d.strftime("%Y-%m-%d") for d in dates[:n]]
+        domestic = {
+            key: pd.DataFrame({"日期": domestic_dates,
+                               "收盘价": [100 + i * 0.2 for i in range(n)]})
+            for key in ("AU0", "AG0", "CU0", "AL0", "ZN0", "RB0", "I0", "M0", "JM0", "LH0")
+        }
+        fake = mock.Mock()
+        fake.futures_foreign_hist.side_effect = lambda symbol: foreign[symbol]
+        fake.futures_main_sina.side_effect = lambda symbol: domestic[symbol]
+        fake.index_us_stock_sina.side_effect = lambda symbol: _daily_frame(dates[:n], [5000.0] * n)
+        return fake
+
+    @pytest.mark.parametrize("name,expected", [
+        ("云铝股份", ["AL0"]),
+        ("江西铜业", ["CU0", "HG"]),
+        ("山东黄金", ["AU0", "GC"]),
+        ("中国海油", ["CL"]),
+        ("新天然气", ["NG"]),
+        ("牧原股份", ["LH0", "M0"]),
+        ("宝钢股份", ["RB0"]),
+        # precision over recall: a bare 金 is wind power / real estate, not gold
+        ("金风科技", []),
+        ("金地集团", []),
+        ("贵州茅台", []),
+    ])
+    def test_stock_futures_map(self, name, expected):
+        assert gm.stock_futures_map(name) == expected
+
+    def test_snapshot_moves_kind_and_lookahead(self, monkeypatch):
+        dates = pd.bdate_range(end="2026-06-24", periods=30)
+        monkeypatch.setattr(gm, "ak", self._fake_ak(dates))
+        snap = gm.futures_snapshot("2026-06-24")
+        assert snap["GC"]["name"] == "COMEX黄金" and snap["GC"]["kind"] == "global"
+        assert snap["AL0"]["kind"] == "domestic"
+        # steadily rising series → positive moves
+        assert snap["GC"]["moves"]["1d"] > 0 and snap["GC"]["moves"]["5d"] > 0
+        early = gm.futures_snapshot("2026-06-10")
+        assert early["GC"]["close"].index.max() <= pd.Timestamp("2026-06-10")
+
+    def test_snapshot_cached_across_calls(self, monkeypatch):
+        dates = pd.bdate_range(end="2026-06-24", periods=30)
+        fake = self._fake_ak(dates)
+        monkeypatch.setattr(gm, "ak", fake)
+        gm.futures_snapshot("2026-06-24")
+        assert fake.futures_foreign_hist.call_count == 5
+        assert fake.futures_main_sina.call_count == 10
+        gm.futures_snapshot("2026-06-24")
+        assert fake.futures_foreign_hist.call_count == 5   # no refetch within TTL
+
+    def test_snapshot_partial_failure_degrades(self, monkeypatch):
+        dates = pd.bdate_range(end="2026-06-24", periods=30)
+        fake = self._fake_ak(dates)
+        original = fake.futures_foreign_hist.side_effect
+
+        def flaky(symbol):
+            if symbol == "NG":
+                raise RuntimeError("boom")
+            return original(symbol)
+
+        fake.futures_foreign_hist.side_effect = flaky
+        monkeypatch.setattr(gm, "ak", fake)
+        snap = gm.futures_snapshot("2026-06-24")
+        assert "NG" not in snap and "GC" in snap and "AL0" in snap
+
+    def test_context_line_lists_mapped_futures(self, monkeypatch):
+        dates = pd.bdate_range(end="2026-06-24", periods=30)
+        monkeypatch.setattr(gm, "ak", self._fake_ak(dates))
+        snap = gm.futures_snapshot("2026-06-24")
+        line = gm.futures_context_line("云铝股份", snap)
+        assert line and "沪铝" in line
+        assert gm.futures_context_line("贵州茅台", snap) is None
+
+    def test_exposure_table_contains_futures_rows(self, monkeypatch):
+        dates = pd.bdate_range(end="2026-06-24", periods=260)
+        fake = self._fake_ak(dates)
+        yields = pd.DataFrame({
+            "日期": [d.strftime("%Y-%m-%d") for d in dates],
+            "美国国债收益率2年": [4.0] * len(dates),
+            "美国国债收益率10年": [4.2] * len(dates),
+        })
+        fake.bond_zh_us_rate.return_value = yields
+        monkeypatch.setattr(gm, "ak", fake)
+        target = pd.DataFrame({
+            "Date": dates, "Open": 10.0, "High": 11.0, "Low": 9.0,
+            "Close": [10 + 0.05 * ((-1) ** i) for i in range(len(dates))],
+            "Volume": 1e6,
+        })
+        with mock.patch.object(gm, "load_ohlcv", return_value=target):
+            with mock.patch("tradingagents.dataflows.money_flow.fetch_money_flow",
+                            side_effect=RuntimeError("skip")):
+                out = gm.get_factor_exposure.func("600519.SS", "2026-06-24", 120)
+        for label in ("COMEX黄金", "NYMEX原油", "沪铜", "沪铝", "螺纹钢", "生猪"):
+            assert f"| {label}" in out
+        assert "联动最强的期货" in out or "噪声级" in out
+
+
+
     def test_macro_spec_registered(self):
         from tradingagents.graph.analyst_execution import (
             ANALYST_NODE_SPECS,
@@ -308,3 +425,38 @@ class TestThsFallback:
         today = pd.Timestamp.today().strftime("%Y-%m-%d")
         with pytest.raises(NoMarketDataError):
             mf.fetch_money_flow("600519.SS", today, 30, retries=1)
+
+
+@pytest.mark.unit
+class TestMacroToolDegradation:
+    """Tool bodies must never raise through ToolNode: a NoMarketDataError from
+    get_money_flow (EM throttled + THS snapshot miss on 000792.SZ) once killed
+    a live run at the macro stage. Every macro tool now degrades to a sentinel
+    the analyst is told to cite honestly."""
+
+    def test_money_flow_degrades_on_no_market_data(self, monkeypatch):
+        from tradingagents.dataflows import money_flow
+        from tradingagents.dataflows.errors import NoMarketDataError
+
+        monkeypatch.setattr(
+            money_flow, "fetch_money_flow",
+            mock.Mock(side_effect=NoMarketDataError("000792.SZ", "000792", "no rows")),
+        )
+        out = gm.get_money_flow.func("000792.SZ", "2026-09-01", 30)
+        assert "数据暂不可用" in out and "get_money_flow" in out
+
+    def test_gold_price_degrades_when_vendor_down(self, monkeypatch):
+        fake = mock.Mock()
+        fake.futures_foreign_hist.side_effect = RuntimeError("sina down")
+        monkeypatch.setattr(gm, "ak", fake)
+        out = gm.get_gold_price.func("2026-09-01", 30)
+        assert "数据暂不可用" in out and "get_gold_price" in out
+
+    def test_factor_exposure_degrades_without_ohlcv(self, monkeypatch):
+        from tradingagents.dataflows.errors import NoMarketDataError
+
+        _mock_ak(monkeypatch)
+        with mock.patch.object(gm, "load_ohlcv",
+                               side_effect=NoMarketDataError("x", "x", "none")):
+            out = gm.get_factor_exposure.func("600519.SS", "2026-06-24", 120)
+        assert "数据暂不可用" in out

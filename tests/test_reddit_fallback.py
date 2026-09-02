@@ -27,6 +27,12 @@ _SAMPLE_ATOM = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+@pytest.fixture(autouse=True)
+def _reset_breaker(monkeypatch):
+    """The circuit breaker is process-global; isolate it per test."""
+    monkeypatch.setattr(reddit, "_fail_until", 0.0)
+
+
 def _resp(read_fn):
     """A minimal context-manager response whose read() runs ``read_fn``."""
     class _Resp:
@@ -87,7 +93,7 @@ class TestRssParsing:
 
     def test_malformed_xml_fails_open(self):
         with patch.object(reddit, "urlopen", return_value=_resp(lambda: b"<<not xml>>")):
-            assert reddit._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0) == []
+            assert reddit._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0) is None
 
 
 @pytest.mark.unit
@@ -138,7 +144,7 @@ class TestRss429Backoff:
              patch.object(reddit.time, "sleep"):
             posts = reddit._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0)
         assert op.call_count == 2          # one retry, then gives up cleanly
-        assert posts == []
+        assert posts is None
 
     def test_retry_after_header_is_honoured(self):
         err = HTTPError("url", 429, "Too Many Requests", {"Retry-After": "12"}, None)
@@ -155,7 +161,7 @@ class TestChunkedTransferErrorsHandled:
 
     def test_rss_incomplete_read_degrades_to_empty(self):
         with patch.object(reddit, "urlopen", return_value=_raise(http.client.IncompleteRead(b""))):
-            assert reddit._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0) == []
+            assert reddit._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0) is None
 
     def test_json_incomplete_read_falls_back_to_rss(self):
         with patch.object(reddit, "urlopen", return_value=_raise(http.client.IncompleteRead(b""))), \
@@ -212,3 +218,44 @@ class TestCryptoSearchTerm:
 
     def test_equity_passes_through(self):
         assert self._captured_ticker("NVDA") == "NVDA"
+
+
+@pytest.mark.unit
+class TestRedditCircuitBreaker:
+    def test_total_outage_opens_breaker_and_skips_network(self):
+        calls = {"n": 0}
+
+        def boom(req, timeout=None):
+            calls["n"] += 1
+            raise TimeoutError("handshake timed out")
+
+        with patch.object(reddit, "urlopen", side_effect=boom):
+            first = reddit.fetch_reddit_posts("NVDA")
+            second = reddit.fetch_reddit_posts("NVDA")
+        assert calls["n"] == 3                    # first run: 3 subreddits, then breaker
+        assert "circuit-breaker" in first
+        assert "circuit-breaker" in second
+
+    def test_partial_failure_does_not_trip_breaker(self):
+        def one_ok_one_dead(req, timeout=None):
+            if "wallstreetbets" in req.full_url:
+                raise TimeoutError("dead")
+            return _atom_resp()
+
+        with patch.object(reddit, "urlopen", side_effect=one_ok_one_dead):
+            out = reddit.fetch_reddit_posts("NVDA", subreddits=["wallstreetbets", "stocks"],
+                                            inter_request_delay=0)
+        assert reddit._fail_until == 0.0          # mixed results stay open for business
+        assert "r/stocks" in out and "2 recent posts" in out
+
+    def test_success_clears_breaker(self):
+        with patch.object(reddit, "urlopen", side_effect=TimeoutError("dead")):
+            reddit.fetch_reddit_posts("NVDA", subreddits=["stocks"],
+                                      inter_request_delay=0)
+        assert reddit._fail_until > 0            # outage opened the breaker
+        reddit._fail_until = __import__("time").time() - 1   # window elapses
+        with patch.object(reddit, "urlopen", return_value=_atom_resp()):
+            out = reddit.fetch_reddit_posts("NVDA", subreddits=["stocks"],
+                                            inter_request_delay=0)
+        assert "2 recent posts" in out
+        assert reddit._fail_until == 0.0         # success clears it

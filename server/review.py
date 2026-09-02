@@ -2,7 +2,7 @@
 
 Screening runs record their picks at selection time; this module closes the
 loop by measuring what those picks actually did afterwards, so the screeners'
-thresholds ("≥80% probability", "score ≥ 8/16") become falsifiable instead of
+thresholds ("≥80% probability", "score ≥ 8/18") become falsifiable instead of
 narrative.
 
 Settlement is lazy and per-run: the review page lists settled aggregates

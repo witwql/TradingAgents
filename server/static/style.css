@@ -317,9 +317,16 @@ h3 { font-size: 15px; margin-bottom: 10px; }
 .vs-metric.good { border-color: var(--green); color: var(--green); }
 .vs-metric.warn { border-color: var(--amber); color: var(--amber); }
 .vs-metric.bad  { border-color: var(--red); color: var(--red); }
+.vs-changes { margin: 6px 0 10px; padding: 6px 12px; border: 1px dashed var(--border); border-radius: 8px; font-size: 13px; }
+.vs-changes b { font-weight: 600; }
+.badge.entered { color: var(--red); border: 1px solid var(--red); margin-left: 6px; font-size: 11px; padding: 1px 8px; }
 
 .agent-link { margin-left: 8px; }
 .agent-badge { display:inline-block; border:1px solid; border-radius:999px; padding:2px 12px; font-size:12px; text-decoration:none; cursor:pointer; }
 .agent-badge.rating-buy { border-color:var(--green); color:var(--green); }
 .agent-badge.rating-sell { border-color:var(--red); color:var(--red); }
 .agent-badge.rating-hold { border-color:var(--amber); color:var(--amber); }
+
+/* ------- 期货行情 ------- */
+#futures-table th:not(:first-child), #futures-table td:not(:first-child) { text-align: right; }
+.fut-spark { display: block; margin-left: auto; }

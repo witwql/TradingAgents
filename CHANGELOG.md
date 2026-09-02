@@ -9,6 +9,39 @@ Breaking changes within the 0.x line are called out explicitly.
 ## Unreleased
 
 ### Added
+- **期货行情板块**（Dashboard 新菜单页）：68 个主力连续合约的实时行情与
+  40 日收盘走势，全部来自新浪财经（与自选股行情同一 Referer 门禁来源）。
+  覆盖上期所/能源中心/大商所/郑商所商品、中金所金融期货（IF/IH/IC/IM/国债）
+  与 NYMEX/COMEX/CBOT/CME 外盘；涨跌幅以昨结算价为基准（中金所实时报文无
+  结算价，以昨收盘为基准，已对日线接口交叉核对）。支持按涨幅/跌幅重新排序
+  与 全部/商品/金融/国际 分类筛选；行情单次批量拉取 + 20s TTL 缓存，走势由
+  后台线程按 6h TTL 刷新（`server/futures.py`，`GET /api/futures`）。
+- **Global futures influence factors** across the pipeline, fed by one shared
+  15-symbol basket (外盘 GC/SI/HG/CL/NG + 国内沪金银铜铝锌、螺纹、铁矿、豆粕、
+  焦煤、生猪; Sina-sourced, process-cached per day):
+  - **个股分析**: `get_factor_exposure` now regresses the target against the
+    whole basket on top of US10Y/SPX/主力资金 — the report names the futures
+    the stock actually tracks (联动最强的期货) and the macro analyst prompt
+    documents the commodity anchors.
+  - **明日精选·动量**: new F7 相关期货利多脉冲 factor (any mapped futures
+    day-move ≥ +1%), scored with the same per-stock conditional-frequency
+    machinery; stocks are matched to futures by unambiguous name keywords.
+  - **明日精选·价值**: picks/watchlist carry a 关联期货 annotation (display
+    only — the value score stays purely fundamental).
+- **Value screener daily rotation**: a 距52周低点 price dimension (0-2, from
+  the Baidu market-cap series already fetched — no new requests) lifts the
+  score cap to 0-18 and is the only daily-moving scored input (fundamentals
+  are quarterly), so the picks board now rotates with price between reporting
+  seasons. Score ties break by cheaper PE-TTM, then smaller cap, then code
+  (stable ties used to freeze the ordering); the board shows run-over-run
+  轮动 (新进/跌出 vs the previous finished run) and each card labels its
+  statement period (一季报/半年报/三季报/年报).
+- **Per-request LLM timeout** (`llm_timeout`, default 600s, env
+  `TRADINGAGENTS_LLM_TIMEOUT`): forwarded to every provider chat client.
+  The load-bearing guard behind the hang fix below — without it a wedged
+  provider connection (request accepted, response never sent) stalls the
+  calling node forever, and langgraph's node retry policy never sees an
+  exception to act on. 0/None disables the cap.
 - **A-share data vendors**: AKShare (EastMoney/THS) and Sina as first-class
   vendor families with declared fallback chains (`sina,akshare,yfinance`),
   in-market ETF support (51/56/58/15 codes), bare-code auto-resolution
@@ -31,6 +64,33 @@ Breaking changes within the 0.x line are called out explicitly.
   history, watchlist for near-misses.
 
 ### Fixed
+- **A throttled EastMoney killed whole analyses at the macro stage**: for
+  000792.SZ the fund-flow tool raised `NoMarketDataError` (EM throttled, THS
+  snapshot had no row for it) straight through ToolNode and the task died.
+  Every macro tool now degrades to an explicit "unavailable" sentinel
+  (`_graceful` wrapper) that instructs the analyst to continue on the
+  remaining sources and never fabricate the missing numbers.
+- **Unreachable overseas vendors no longer burn ~2 min per analysis**:
+  StockTwits (permanent 403), Reddit RSS (SSL handshake timeouts across all
+  3 subreddits) and Polymarket (30s read timeout on every topic search) now
+  carry process-level circuit breakers — the first failure opens a 10-min
+  cooldown during which calls return the placeholder instantly; a success
+  clears it. Reddit trips only on a total outage (every subreddit failed),
+  not a partial one.
+- Polymarket markets with a bare-date `endDate` ("2026-12-31") raised a
+  naive-vs-aware datetime `TypeError` inside the forward-looking filter,
+  making them permanently unusable; date-only values now normalize to UTC.
+- **Dashboard tasks no longer hang forever on a wedged LLM call.** A
+  glm-5.3-flash run stalled silently for 50+ minutes in the market stage:
+  the third Market Analyst call to open.bigmodel.cn never returned, no
+  timeout existed anywhere in the chain, and langgraph's RetryPolicy
+  (fires on exceptions only) had nothing to act on. Two layers now bound
+  the stall: the `llm_timeout` cap above turns a hang into a retriable
+  exception, and a queue watchdog thread fails any running task that
+  emits no events for 40 min (env `TRADINGAGENTS_TASK_MAX_IDLE`). Task
+  completion/failure writes are WHERE-guarded (`*_unless_terminal`), so a
+  late-finishing worker cannot resurrect a task the watchdog declared
+  dead, and the UI gets a terminal status instead of waiting on a ghost.
 - **SSE live stream crashed with `KeyError: 'payload'`** whenever a bus
   event won the race against the DB re-poll (every subscriber attached
   to a running task): `queue.emit` published events flattened while the

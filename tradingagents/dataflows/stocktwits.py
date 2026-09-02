@@ -17,6 +17,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import time
 from urllib.request import Request, urlopen
 
 from .symbol_utils import crypto_base
@@ -25,6 +26,13 @@ logger = logging.getLogger(__name__)
 
 _API = "https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
 _UA = "tradingagents/0.2 (+https://github.com/TauricResearch/TradingAgents)"
+
+# Circuit breaker: a 403 (anonymous access refused) or an unreachable host
+# stays failed for minutes, but every run paid the request cost again. After
+# the first failure the process skips the network entirely for the cooldown
+# window; a successful fetch clears it so a transient outage doesn't stick.
+_COOLDOWN_SECONDS = 600
+_fail_until = 0.0
 
 
 def _stocktwits_symbol(ticker: str) -> str:
@@ -46,6 +54,10 @@ def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.
     symbol has no messages, or the response shape is unexpected — the
     caller never has to special-case None or exceptions.
     """
+    global _fail_until
+    if time.time() < _fail_until:
+        return "<stocktwits unavailable: circuit-breaker open after repeated failures>"
+
     url = _API.format(ticker=_stocktwits_symbol(ticker))
     req = Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
     try:
@@ -54,9 +66,12 @@ def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.
     except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
         # OSError covers URLError/TimeoutError/connection resets; HTTPException
         # covers chunked-transfer errors (IncompleteRead/BadStatusLine, #1024).
-        logger.warning("StockTwits fetch failed for %s: %s", ticker, exc)
+        _fail_until = time.time() + _COOLDOWN_SECONDS
+        logger.warning("StockTwits fetch failed for %s: %s — cooling down %ss",
+                       ticker, exc, _COOLDOWN_SECONDS)
         return f"<stocktwits unavailable: {type(exc).__name__}>"
 
+    _fail_until = 0.0
     messages = data.get("messages", []) if isinstance(data, dict) else []
     if not messages:
         return f"<no StockTwits messages found for ${ticker.upper()}>"

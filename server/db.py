@@ -243,6 +243,64 @@ class Database:
         refreshed = self.get_task(task["id"])
         return refreshed if refreshed and refreshed["status"] == "running" else None
 
+    def stalled_running_tasks(self, max_idle: float, now: float | None = None) -> list[dict]:
+        """Running tasks whose last activity is older than ``max_idle`` seconds.
+
+        Last activity is the newest task_events row, falling back to
+        ``started_at`` for tasks that have not emitted anything yet. A worker
+        wedged in a call that never returns stops emitting events, so this is
+        the signal the queue watchdog acts on. ``now`` is injectable for tests.
+        """
+        now = time.time() if now is None else now
+        return self.fetchall(
+            "SELECT t.* FROM tasks t WHERE t.status='running' AND"
+            " COALESCE((SELECT MAX(e.ts) FROM task_events e WHERE e.task_id=t.id),"
+            "          t.started_at) < ?"
+            " ORDER BY t.started_at",
+            (now - max_idle,),
+        )
+
+    _TERMINAL_TASK_STATES = ("completed", "failed", "cancelled")
+
+    def fail_task_unless_terminal(self, task_id: str, error: str) -> bool:
+        """Atomically fail a task unless it already reached a terminal state.
+
+        Same WHERE-guard pattern as cancel_if_pending: the watchdog may fail a
+        task whose worker is still alive in a blocked call, and a later state
+        write from that worker must not resurrect it. Non-terminal (pending/
+        running) tasks are writable — a worker crashing before its row was
+        claimed still needs its failure recorded.
+        """
+        placeholders = ",".join("?" * len(self._TERMINAL_TASK_STATES))
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE tasks SET status='failed', error=?, finished_at=?"
+                f" WHERE id=? AND status NOT IN ({placeholders})",
+                (error, time.time(), task_id, *self._TERMINAL_TASK_STATES),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def complete_task_unless_terminal(self, task_id: str, *, rating: str, summary: str,
+                                      report_dir: str) -> bool:
+        """Atomically complete a task unless it already reached a terminal state.
+
+        Guards the success path the same way fail_task_unless_terminal guards
+        the failure path: a worker that finishes long after the watchdog
+        declared the task dead must not overwrite the verdict with 'completed'.
+        """
+        placeholders = ",".join("?" * len(self._TERMINAL_TASK_STATES))
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE tasks SET status='completed', rating=?, summary=?, report_dir=?,"
+                f" current_stage='done', finished_at=?"
+                f" WHERE id=? AND status NOT IN ({placeholders})",
+                (rating, summary, report_dir, time.time(), task_id,
+                 *self._TERMINAL_TASK_STATES),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
     def request_screen_cancel(self, run_id: str) -> bool:
         """Cooperative cancellation: flag the run; the worker checks per item."""
         with self._lock:

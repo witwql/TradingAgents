@@ -16,6 +16,12 @@ from tradingagents.dataflows import interface, polymarket
 from tradingagents.dataflows.config import set_config
 
 
+@pytest.fixture(autouse=True)
+def _reset_breaker(monkeypatch):
+    """The circuit breaker is process-global; isolate it per test."""
+    monkeypatch.setattr(polymarket, "_fail_until", 0.0)
+
+
 def _market(question, prob, *, volume, end_date, closed=False, wk=None):
     return {
         "question": question,
@@ -127,3 +133,31 @@ class PolymarketRoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.unit
+class TestPolymarketCircuitBreaker:
+    def test_network_failure_opens_breaker(self):
+        with mock.patch.object(polymarket.requests, "get",
+                               side_effect=requests.ReadTimeout("t")) as g:
+            first = polymarket.get_prediction_markets("Fed rate cut")
+            second = polymarket.get_prediction_markets("recession 2026")
+        assert g.call_count == 1                  # breaker skips the second search
+        assert "unavailable" in first
+        assert "circuit-breaker" in second
+
+    def test_success_clears_breaker(self):
+        payload = {"events": [{"markets": [_market("Fed cuts in 2026", 0.76,
+                                                   volume=1e6, end_date="2026-12-31")]}]}
+        resp = mock.Mock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = payload
+        with mock.patch.object(polymarket.requests, "get",
+                               side_effect=requests.ReadTimeout("t")):
+            polymarket.get_prediction_markets("Fed rate cut")
+        assert polymarket._fail_until > 0         # outage opened the breaker
+        polymarket._fail_until = __import__("time").time() - 1   # window elapses
+        with mock.patch.object(polymarket.requests, "get", return_value=resp):
+            out = polymarket.get_prediction_markets("Fed rate cut")
+        assert "76%" in out
+        assert polymarket._fail_until == 0.0      # success clears it

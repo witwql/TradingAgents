@@ -29,6 +29,12 @@ def _raise(exc):
     return _Resp()
 
 
+@pytest.fixture(autouse=True)
+def _reset_breaker(monkeypatch):
+    """The circuit breaker is process-global; isolate it per test."""
+    monkeypatch.setattr(stocktwits, "_fail_until", 0.0)
+
+
 @pytest.mark.unit
 class TestStockTwitsResilience:
     @pytest.mark.parametrize(
@@ -75,3 +81,45 @@ class TestStockTwitsCryptoSymbols:
         with patch.object(stocktwits, "urlopen", side_effect=fake_urlopen):
             stocktwits.fetch_stocktwits_messages("BTC-USD")
         assert "/symbol/BTC.X.json" in seen["url"]
+
+
+@pytest.mark.unit
+class TestStockTwitsCircuitBreaker:
+    def test_failure_opens_breaker_second_call_skips_network(self):
+        calls = {"n": 0}
+
+        def boom(req, timeout=None):
+            calls["n"] += 1
+            raise HTTPError("url", 403, "Forbidden", {}, None)
+
+        with patch.object(stocktwits, "urlopen", side_effect=boom):
+            first = stocktwits.fetch_stocktwits_messages("NVDA")
+            second = stocktwits.fetch_stocktwits_messages("NVDA")
+        assert calls["n"] == 1                    # only the first call hit the wire
+        assert "403" in first or "HTTPError" in first
+        assert "circuit-breaker" in second
+
+    def test_success_clears_breaker(self):
+        import json as _json
+        import time as _time
+        payload = _json.dumps({"messages": []}).encode()
+
+        class _Ok:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def read(self):
+                return payload
+
+        # real failure opens the breaker...
+        with patch.object(stocktwits, "urlopen",
+                          side_effect=HTTPError("url", 403, "Forbidden", {}, None)):
+            stocktwits.fetch_stocktwits_messages("NVDA")
+        assert stocktwits._fail_until > 0
+        # ...the cooldown window elapses... and the next success clears it
+        stocktwits._fail_until = _time.time() - 1
+        with patch.object(stocktwits, "urlopen", return_value=_Ok()):
+            out = stocktwits.fetch_stocktwits_messages("NVDA")
+        assert "no StockTwits messages" in out
+        assert stocktwits._fail_until == 0.0

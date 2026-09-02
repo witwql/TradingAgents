@@ -1,9 +1,11 @@
 """明日精选 screener: rank main-board stocks by next-day-up probability.
 
 Model contract (honest by design):
-- A multi-factor resonance engine scores each stock on five binary setups
+- A multi-factor resonance engine scores each stock on five price setups
   (pullback-in-uptrend, volume breakout, MACD zero-line cross, RSI strength,
-  shrinking-volume stabilization).
+  shrinking-volume stabilization) plus two data-fed factors when available:
+  主力资金净流入配合 (f6, EastMoney flow) and 相关期货利多脉冲 (f7, a mapped
+  futures day-move ≥ +1% from the shared global-futures basket).
 - Every factor's probability contribution comes from the STOCK'S OWN 500-day
   history: P(next-day up | factor fired), with sample size shown. No factor
   with fewer than 30 historical occurrences is trusted.
@@ -162,6 +164,36 @@ def append_money_flow_factor(d: pd.DataFrame, flow: pd.DataFrame) -> pd.DataFram
     return d
 
 
+FUTURES_PULSE_PCT = 1.0       # 任一映射期货当日涨幅阈值
+
+
+def append_futures_factor(d: pd.DataFrame, futures: dict) -> pd.DataFrame:
+    """F7 相关期货利多脉冲: 任一映射期货当日涨幅 ≥ +1%。
+
+    A futures daily bar (day session + night) belongs to its trade date and
+    is known by the time the screener runs (after the A-share close), so the
+    T bar fires F7 on T and the per-stock conditional stats read P(up T+1 |
+    pulse on T) — no shift, no look-ahead. Days without a mapped futures bar
+    (pre-listing, holiday mismatch) are False.
+    """
+    if not futures:
+        return d
+    best: dict[pd.Timestamp, float] = {}
+    for info in futures.values():
+        s = (info["close"].pct_change() * 100).dropna()
+        for ts, v in s.items():
+            day = pd.Timestamp(ts).normalize()
+            if day not in best or v > best[day]:
+                best[day] = v
+    if not best:
+        return d
+    d = d.copy()
+    d["f7_futures"] = (
+        pd.to_datetime(d["Date"]).dt.normalize().map(best).fillna(0.0) >= FUTURES_PULSE_PCT
+    )
+    return d
+
+
 FACTOR_LABELS = {
     "f1_pullback": "多头排列回踩MA10",
     "f2_breakout": "放量突破20日高",
@@ -169,6 +201,7 @@ FACTOR_LABELS = {
     "f4_rsi": "RSI强势区上行",
     "f5_shrink_stabilize": "缩量回踩收阳企稳",
     "f6_money": "主力资金净流入配合",
+    "f7_futures": "相关期货利多脉冲(≥+1%)",
 }
 
 # 价格五因子必然存在；f6 依赖资金流数据（EM 限流时优雅缺席）。
@@ -249,8 +282,14 @@ def _resonance_calibration(d: pd.DataFrame) -> tuple[float | None, int]:
 # Per-stock pipeline
 # ---------------------------------------------------------------------------
 
-def evaluate_stock(code: str, name: str, price: float, curr_date: str) -> dict | None:
-    """Full evaluation for one candidate; None when data unusable."""
+def evaluate_stock(code: str, name: str, price: float, curr_date: str,
+                   futures: dict | None = None) -> dict | None:
+    """Full evaluation for one candidate; None when data unusable.
+
+    ``futures`` is the shared basket snapshot (prefetched once per run); when
+    provided and the stock name maps to commodities, the F7 期货脉冲 factor
+    and a futures_context annotation are added.
+    """
     from tradingagents.dataflows.sina_stock import fetch_daily_ohlcv_sina
 
     canonical = f"{code}.SS" if code.startswith(("6",)) else f"{code}.SZ"
@@ -286,6 +325,31 @@ def evaluate_stock(code: str, name: str, price: float, curr_date: str) -> dict |
         except Exception as exc:
             logger.debug("screener: money flow unavailable for %s: %s", code, exc)
 
+    # F7 is cache-fed (no per-stock network cost), so it applies whenever the
+    # name maps to commodities, regardless of the money-flow gate above.
+    futures_context = None
+    if futures:
+        relevant = {}
+        try:
+            from tradingagents.dataflows.global_macro import (
+                futures_context_line,
+                stock_futures_map,
+            )
+
+            relevant = {k: futures[k] for k in stock_futures_map(name) if k in futures}
+            futures_context = futures_context_line(name, futures)
+        except Exception as exc:
+            logger.debug("screener: futures context unavailable for %s: %s", code, exc)
+        if relevant:
+            d = append_futures_factor(d, relevant)
+            stats = _factor_stats(d)
+            prob, contributions, fired = _composite_probability(d, stats)
+            if futures_context:
+                for c in contributions:
+                    if c["factor"].startswith("相关期货"):
+                        c["note"] = futures_context
+                        break
+
     if prob is None:
         return None
 
@@ -297,7 +361,9 @@ def evaluate_stock(code: str, name: str, price: float, curr_date: str) -> dict |
         "close": float(last["Close"]),
         "probability": round(prob, 4),
         "factors_fired": fired,
+        "factors_available": len(_active_factor_columns(d)),
         "contributions": contributions,
+        "futures_context": futures_context,
         "resonance_hit_rate": round(hit, 4) if hit is not None else None,
         "resonance_samples": hit_n,
         "history_days": int(len(d)),
@@ -330,6 +396,17 @@ def _run_blocking(db, run_id: str, curr_date: str | None):
         curr = curr_date or dt.date.today().strftime("%Y-%m-%d")
         universe = fetch_universe()
         logger.info("screener: universe=%d candidates", len(universe))
+
+        # One basket snapshot for the whole run (~15 cached Sina calls),
+        # shared by every candidate's F7 factor; failure degrades to f1-f6.
+        try:
+            from tradingagents.dataflows.global_macro import futures_snapshot
+
+            futures = futures_snapshot(curr)
+        except Exception as exc:
+            logger.info("screener: futures snapshot unavailable (%s)", exc)
+            futures = None
+
         db.execute(
             "UPDATE screen_runs SET stage='analyzing', total=?, processed=0 WHERE id=?",
             (len(universe), run_id),
@@ -339,11 +416,12 @@ def _run_blocking(db, run_id: str, curr_date: str | None):
         done_count = 0
         cancelled = False
         with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {
-                pool.submit(evaluate_stock, u["code"], u["name"], u["price"], curr): u
+            futures_jobs = {
+                pool.submit(evaluate_stock, u["code"], u["name"], u["price"], curr,
+                            futures=futures): u
                 for u in universe
             }
-            for fut in as_completed(futures):
+            for fut in as_completed(futures_jobs):
                 done_count += 1
                 r = fut.result()
                 if r:

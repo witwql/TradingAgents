@@ -46,7 +46,9 @@ Overnight factor families (native tools available — call them, do NOT describe
 3. get_us_treasury_yields — 美债 2Y/10Y: discount-rate pressure on growth, yield assets' appeal.
 4. get_us_stock_indices — 美股三大指数: leads A-share open sentiment.
 5. get_money_flow — 主力资金（超大单+大单）净流入：进攻/出货/吸筹识别，含量价背离警示。
-6. get_factor_exposure — 相关系数/β/隔夜综合得分（已含主力资金因子，必须调用并引用其数字）。
+6. get_factor_exposure — 相关系数/β/隔夜综合得分。因子集已含 15 个期货品种
+   （外盘 GC/SI/HG/CL/NG + 国内沪金银铜铝锌、螺纹、铁矿、豆粕、焦煤、生猪）与
+   主力资金因子，必须调用并引用其数字；表中「联动最强的期货」即该标的的商品锚。
 
 Method: call each factor tool once, call get_factor_exposure for the target,
 then write the final report. Noise-level correlations (|r|<0.15) must be

@@ -11,12 +11,15 @@ scoped view, so concurrent runs never see each other's vendors. The truly
 process-global resources (akshare/py-mini_racer calls, the memory log,
 cache-file writes) carry their own locks; the LLM API is the real
 bottleneck, so more than ~4 workers rarely helps.
+
+A watchdog thread fails any running task that stops emitting events for
+``max_idle`` seconds — a worker wedged in a call that never returns cannot
+be interrupted, but its task row and SSE stream must not hang forever.
 """
 
 import logging
 import os
 import threading
-import time
 
 from .db import Database
 from .runner import ALL_ANALYST_KEYS, build_stages, format_exception
@@ -24,6 +27,14 @@ from .runner import ALL_ANALYST_KEYS, build_stages, format_exception
 logger = logging.getLogger(__name__)
 
 DEFAULT_WORKERS = 2
+
+# Watchdog: a running task that emits no events for this long is wedged in a
+# call that will never return (no timeout anywhere in a vendor/SDK chain).
+# 40 min clears the quiet window of one legitimately timing-out LLM call chain
+# (default llm_timeout 600s x SDK retries 3 ≈ 30 min of silence between node
+# attempts); raise TRADINGAGENTS_TASK_MAX_IDLE alongside llm_timeout.
+DEFAULT_MAX_IDLE = 2400
+WATCHDOG_INTERVAL = 30.0
 
 
 class TaskQueue:
@@ -34,6 +45,7 @@ class TaskQueue:
         workers: int | None = None,
         runner_cls=None,
         bus=None,
+        max_idle: float | None = None,
     ):
         from .runner import AnalysisRunner
 
@@ -46,10 +58,20 @@ class TaskQueue:
                 workers = DEFAULT_WORKERS
             workers = max(1, int(workers))
         self.workers = max(0, int(workers))
+        if max_idle is None:
+            try:
+                max_idle = float(os.environ.get("TRADINGAGENTS_TASK_MAX_IDLE", DEFAULT_MAX_IDLE))
+            except ValueError:
+                max_idle = DEFAULT_MAX_IDLE
+        self.max_idle = float(max_idle)
         self.runner_cls = runner_cls or AnalysisRunner
         self.bus = bus
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        # Tasks the watchdog declared dead while their worker thread was still
+        # blocked; the worker must go quiet and never resurrect them.
+        self._abandoned: set[str] = set()
+        self._abandoned_lock = threading.Lock()
 
     # -- lifecycle -----------------------------------------------------------
     def start(self):
@@ -57,6 +79,10 @@ class TaskQueue:
             t = threading.Thread(
                 target=self._worker_loop, name=f"ta-worker-{i}", daemon=True
             )
+            t.start()
+            self._threads.append(t)
+        if self.workers > 0 and self.max_idle > 0:
+            t = threading.Thread(target=self._watchdog_loop, name="ta-watchdog", daemon=True)
             t.start()
             self._threads.append(t)
 
@@ -92,6 +118,57 @@ class TaskQueue:
             self.db.append_event(task_id, "status", {"status": "cancelled"})
         return cancelled
 
+    # -- events ---------------------------------------------------------------
+    def _publish(self, task_id: str, type_: str, payload: dict):
+        """Append an event row and fan it out to SSE bus subscribers."""
+        try:
+            event_id = self.db.append_event(task_id, type_, payload)
+        except Exception:
+            logger.exception("append_event failed")
+            return
+        if self.bus is not None:
+            try:
+                # Same shape as db.events_since rows (payload nested, not
+                # flattened) — the SSE handler consumes both paths.
+                self.bus.publish(task_id, {
+                    "id": event_id, "type": type_, "payload": payload,
+                })
+            except Exception:
+                logger.exception("event bus publish failed")
+
+    # -- watchdog ---------------------------------------------------------------
+    def _watchdog_loop(self):
+        while not self._stop.wait(WATCHDOG_INTERVAL):
+            try:
+                self._watchdog_sweep()
+            except Exception:
+                logger.exception("task watchdog sweep failed")
+
+    def _watchdog_sweep(self, now: float | None = None) -> list[str]:
+        """Fail running tasks that stopped emitting events; returns their ids.
+
+        A wedged worker cannot be interrupted (threads have no kill), so the
+        row is failed out from under it: SSE consumers get a terminal status
+        instead of waiting on a ghost. The worker's own state writes are
+        WHERE-guarded so it cannot resurrect the task, and its events stay
+        suppressed in case it ever unblocks and drains.
+        """
+        failed: list[str] = []
+        for task in self.db.stalled_running_tasks(self.max_idle, now=now):
+            minutes = self.max_idle / 60
+            error = f"任务看门狗超时：超过 {minutes:.0f} 分钟无任何进展，已标记失败"
+            if not self.db.fail_task_unless_terminal(task["id"], error):
+                continue
+            with self._abandoned_lock:
+                self._abandoned.add(task["id"])
+            failed.append(task["id"])
+            logger.warning(
+                "task %s (%s) idle for %.0f min; watchdog marked it failed",
+                task["id"], task.get("ticker", "?"), minutes,
+            )
+            self._publish(task["id"], "status", {"status": "failed", "error": error})
+        return failed
+
     # -- worker ------------------------------------------------------------------
     def _worker_loop(self):
         while not self._stop.is_set():
@@ -109,15 +186,12 @@ class TaskQueue:
                 self._execute(task)
             except Exception as exc:
                 logger.exception("task %s crashed unexpectedly", task["id"])
-                self.db.update_task(
-                    task["id"],
-                    status="failed",
-                    error=format_exception(exc),
-                    finished_at=time.time(),
-                )
-                self.db.append_event(
-                    task["id"], "status", {"status": "failed", "error": format_exception(exc)}
-                )
+                if self.db.fail_task_unless_terminal(
+                    task["id"], format_exception(exc)
+                ):
+                    self.db.append_event(
+                        task["id"], "status", {"status": "failed", "error": format_exception(exc)}
+                    )
 
     def _execute(self, task: dict):
         db = self.db
@@ -128,20 +202,10 @@ class TaskQueue:
         runner.reset(task_id, db, stages)
 
         def emit(type_: str, payload: dict):
-            try:
-                event_id = db.append_event(task_id, type_, payload)
-            except Exception:
-                logger.exception("append_event failed")
-                return
-            if self.bus is not None:
-                try:
-                    # Same shape as db.events_since rows (payload nested, not
-                    # flattened) — the SSE handler consumes both paths.
-                    self.bus.publish(task_id, {
-                        "id": event_id, "type": type_, "payload": payload,
-                    })
-                except Exception:
-                    logger.exception("event bus publish failed")
+            with self._abandoned_lock:
+                if task_id in self._abandoned:
+                    return
+            self._publish(task_id, type_, payload)
 
         emit("status", {"status": "running", "ticker": task["ticker"]})
         result: dict | None = None
@@ -150,26 +214,26 @@ class TaskQueue:
         except Exception as exc:
             message = format_exception(exc)
             logger.error("task %s failed: %s", task_id, message)
-            db.update_task(
-                task_id,
-                status="failed",
-                error=message,
-                finished_at=time.time(),
-            )
-            emit("status", {"status": "failed", "error": message})
+            # Guarded: the watchdog may have failed this task already; its
+            # verdict (and event) must win over the late crash report.
+            if db.fail_task_unless_terminal(task_id, message):
+                emit("status", {"status": "failed", "error": message})
             return
         finally:
             runner.finish_stages(task_id, db)
 
-        db.update_task(
+        if not db.complete_task_unless_terminal(
             task_id,
-            status="completed",
             rating=result.get("rating", ""),
             summary=result.get("summary", ""),
             report_dir=result.get("report_dir", ""),
-            current_stage="done",
-            finished_at=time.time(),
-        )
+        ):
+            # The watchdog failed this task while the worker was still
+            # finishing; keep that verdict, drop the stale outcome.
+            logger.warning(
+                "task %s finished after being marked failed; outcome dropped", task_id
+            )
+            return
         db.prune_events()
         emit(
             "status",

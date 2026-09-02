@@ -24,10 +24,10 @@ const STAGE_TEXT = {
   bull_researcher: "多方研究", bear_researcher: "空方研究", research_manager: "研究裁决",
   trader: "交易决策", risk_debate: "风险辩论", portfolio_manager: "终审",
 };
-const state = { filterStatus: "", drawerTaskId: null, drawerES: null, cache: {}, feedCount: 0, feedScroll: true, lastScreenRun: null, lastValueRun: null };
+const state = { filterStatus: "", drawerTaskId: null, drawerES: null, cache: {}, feedCount: 0, feedScroll: true, lastScreenRun: null, lastValueRun: null, futuresCat: "all", futuresSort: "desc", futuresData: null };
 
 /* ---------------- router ---------------- */
-const VIEWS = ["dashboard", "new", "tasks", "picks", "review", "reports", "favorites", "settings"];
+const VIEWS = ["dashboard", "new", "tasks", "picks", "review", "reports", "favorites", "futures", "settings"];
 function route() {
   const name = (location.hash || "#dashboard").slice(1) || "dashboard";
   const target = VIEWS.includes(name) ? name : "dashboard";
@@ -41,7 +41,8 @@ function buildNav() {
   $("#nav").innerHTML = VIEWS.map((v) =>
     `<a href="#${v}" data-view="${v}">${{
       dashboard: "工作台", new: "新建分析", tasks: "任务队列",
-      picks: "明日精选", review: "选股复盘", reports: "报告中心", favorites: "自选股", settings: "设置",
+      picks: "明日精选", review: "选股复盘", reports: "报告中心", favorites: "自选股",
+      futures: "期货行情", settings: "设置",
     }[v]}</a>`).join("");
 }
 
@@ -454,13 +455,15 @@ function pickCard(p, idx, muted = false) {
     : `共振日历史样本不足（${p.resonance_samples}），无校准数据`;
   const pct = Math.round(p.probability * 100);
   const probColor = pct >= 80 ? "var(--green)" : "var(--amber)";
+  const futCtx = p.futures_context
+    ? `<div class="calib">🛢 关联期货：${esc(p.futures_context)}</div>` : "";
   return `<div class="pick-card"${muted ? ' style="opacity:.82"' : ""}>
     <div class="pick-head">
       <div class="pick-rank">${idx + 1}</div>
       <span class="pick-ticker">${esc(p.code)}</span>
       <span>${esc(p.name)}</span>
       <span class="pick-price">¥${(p.close ?? 0).toFixed(2)}</span>
-      <span class="muted" style="font-size:12px">命中因子 ${p.factors_fired}/5</span>
+      <span class="muted" style="font-size:12px">命中因子 ${p.factors_fired}/${p.factors_available ?? (p.contributions || []).length}</span>
       <div class="pick-prob">
         <div class="num" style="color:${probColor}">${pct}%</div>
         <div class="lbl">P(次日上涨)</div>
@@ -468,6 +471,7 @@ function pickCard(p, idx, muted = false) {
     </div>
     <div class="prob-bar"><i style="width:${pct}%"></i></div>
     <div class="factor-chips">${chips}</div>
+    ${futCtx}
     <div class="calib">📏 ${calib} · 统计窗口 ${p.history_days} 交易日</div>
   </div>`;
 }
@@ -562,6 +566,124 @@ async function removeFav(code) { await api(`/favorites/${encodeURIComponent(code
 async function quickAnalyze(code) {
   const { task_ids } = await api("/tasks", { method: "POST", body: { tickers: [code] } });
   go("#tasks"); openDrawer(task_ids[0]);
+}
+
+/* ---------------- 期货行情 ---------------- */
+const futuresPoll = { timer: null, fails: 0 };
+
+function fmtFutPrice(v) {
+  if (v == null || isNaN(v)) return "—";
+  const abs = Math.abs(v);
+  const digits = abs >= 10000 ? 0 : abs >= 1000 ? 1 : 2;
+  return v.toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+function fmtWan(v) {
+  if (v == null || isNaN(v)) return "—";
+  return v >= 10000 ? (v / 10000).toFixed(1) + "万" : String(v);
+}
+
+/* 40日收盘迷你走势（SVG），首尾涨跌决定线条颜色 */
+function futuresSpark(closes) {
+  if (!closes || closes.length < 2) return `<span class="muted" style="font-size:11px">—</span>`;
+  const w = 120, h = 28, pad = 2;
+  const min = Math.min(...closes), max = Math.max(...closes), span = (max - min) || 1;
+  const pts = closes.map((c, i) =>
+    [pad + (i / (closes.length - 1)) * (w - 2 * pad), h - pad - ((c - min) / span) * (h - 2 * pad)]);
+  const line = pts.map((p) => p.map((n) => n.toFixed(1)).join(",")).join(" ");
+  const up = closes[closes.length - 1] >= closes[0];
+  const color = up ? "var(--red)" : "var(--green)";
+  const area = `M${pts[0][0].toFixed(1)},${h - pad} L${line.replace(/ /g, " L")} L${pts[pts.length - 1][0].toFixed(1)},${h - pad} Z`;
+  return `<svg class="fut-spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+    <path d="${area}" fill="${color}" opacity="0.08"></path>
+    <polyline points="${line}" fill="none" stroke="${color}" stroke-width="1.4" stroke-linejoin="round"/>
+  </svg>`;
+}
+
+function futuresRow(c) {
+  const pctCls = c.pct == null ? "" : pctTrend(c.pct);
+  return `<tr>
+    <td><strong>${esc(c.name)}</strong><span class="muted" style="font-size:11px"> ${esc(c.symbol)}</span>
+        <div class="muted" style="font-size:11px">${esc(c.exchange)} · ${esc(c.unit)}</div></td>
+    <td><strong>${fmtFutPrice(c.price)}</strong></td>
+    <td class="${pctCls}">${c.pct == null ? "—" : fmtPct(c.pct)}</td>
+    <td class="${pctCls}">${c.change == null ? "—" : (c.change >= 0 ? "+" : "") + fmtFutPrice(c.change)}</td>
+    <td class="muted">${fmtFutPrice(c.open)}</td>
+    <td class="${pctCls}">${fmtFutPrice(c.high)}</td>
+    <td class="${pctCls}">${fmtFutPrice(c.low)}</td>
+    <td class="muted">${fmtWan(c.volume)}</td>
+    <td class="muted">${fmtWan(c.open_interest)}</td>
+    <td>${futuresSpark(c.trend)}</td>
+  </tr>`;
+}
+
+function renderFutures() {
+  const data = state.futuresData;
+  const table = $("#futures-table");
+  if (!data || !data.contracts) { table.innerHTML = ""; return; }
+  const cat = state.futuresCat;
+  const rows = data.contracts
+    .filter((c) => cat === "all" || c.category === cat)
+    .sort((a, b) => {
+      const av = a.pct, bv = b.pct;
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;             // 无涨跌的排末尾
+      if (bv == null) return -1;
+      return state.futuresSort === "desc" ? bv - av : av - bv;
+    });
+  table.innerHTML = `<thead><tr>
+      <th>品种</th><th>最新价</th><th>涨跌幅</th><th>涨跌</th>
+      <th>开盘</th><th>最高</th><th>最低</th><th>成交量</th><th>持仓量</th><th>走势（40日）</th>
+    </tr></thead><tbody>` +
+    (rows.map(futuresRow).join("") ||
+      `<tr><td colspan="10" class="muted">没有该分类下的合约</td></tr>`) +
+    `</tbody>`;
+
+  const meta = $("#futures-meta");
+  const ready = data.quotes_ready !== false;
+  if (!ready) meta.innerHTML = `<span style="color:var(--amber)">行情首次加载中，数秒后自动重试…</span>`;
+  else meta.textContent =
+    `行情 ${fmtTime(data.quote_ts)} 更新 · 每30秒自动刷新` +
+    (data.trend_ready ? ` · 走势覆盖 ${data.trend_count}/${data.contracts.length} 品种` : " · 走势加载中…");
+
+  if (!ready && !futuresPoll.retried) {
+    futuresPoll.retried = true;
+    setTimeout(() => { if (curView() === "futures") pollFutures(); }, 4000);
+  }
+}
+
+async function pollFutures() {
+  clearTimeout(futuresPoll.timer);
+  if (curView() !== "futures") return;      // 离开板块后自终止
+  try {
+    state.futuresData = await api("/futures");
+    futuresPoll.fails = 0;
+    renderFutures();
+  } catch (e) {
+    futuresPoll.fails++;
+    if (futuresPoll.fails > 3) {
+      $("#futures-meta").innerHTML = `<span style="color:var(--red)">行情加载失败：${esc(e.message)}，稍后重试。</span>`;
+    }
+  }
+  // 页面不可见时放缓节奏，回前台恢复 30 秒刷新
+  if (!document.hidden) futuresPoll.timer = setTimeout(pollFutures, 30000);
+  else futuresPoll.timer = setTimeout(pollFutures, 60000);
+}
+
+function loadFutures() {
+  $$("#futures-cats .seg-btn").forEach((b) => b.onclick = () => {
+    state.futuresCat = b.dataset.cat;
+    $$("#futures-cats .seg-btn").forEach((x) => x.classList.toggle("active", x === b));
+    renderFutures();
+  });
+  $$("#futures-sort .seg-btn").forEach((b) => b.onclick = () => {
+    state.futuresSort = b.dataset.sort;
+    $$("#futures-sort .seg-btn").forEach((x) => x.classList.toggle("active", x === b));
+    renderFutures();
+  });
+  if (state.futuresData) renderFutures();  // 先渲染缓存，再后台刷新
+  futuresPoll.fails = 0;
+  pollFutures();
 }
 
 /* ---------------- settings ---------------- */
@@ -663,7 +785,7 @@ function loadView(name) {
   try {
     ({ dashboard: loadDashboard, new: buildAnalystPicker, tasks: loadTasks,
        picks: loadPicks, review: loadReview, reports: loadReports, favorites: loadFavorites,
-       settings: loadSettings }[name] || (() => {}) )();
+       futures: loadFutures, settings: loadSettings }[name] || (() => {}) )();
   } catch (e) {
     console.error(`view ${name} failed:`, e);
     const box = $(`section[data-view="${name}"]`);
@@ -677,6 +799,15 @@ function loadView(name) {
 /* ---------------- 价值精选 ---------------- */
 const valuePoll = { timer: null, fails: 0, watching: false };
 let valuePrevStatus = null;
+
+const VALUE_PERIOD_LABELS = { "03-31": "一季报", "06-30": "半年报", "09-30": "三季报", "12-31": "年报" };
+
+function valuePeriodText(period) {
+  const raw = String(period || "");
+  if (!raw) return "";
+  const label = VALUE_PERIOD_LABELS[raw.slice(5)] || "定期报告";
+  return `${raw}（${label}）`;
+}
 
 function switchPicksTab(tab) {
   $$("#picks-tabs .seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
@@ -700,7 +831,7 @@ async function startValueScreening() {
   try {
     const resp = await api("/value-screen", { method: "POST" });
     showToast(resp.already_running ? "价值筛选已在运行" : "价值筛选已启动",
-              "新浪财务指标 → 百度估值 → 16分制评分");
+              "新浪财务指标 → 百度估值 → 18分制评分");
     valuePrevStatus = null;
     valuePoll.fails = 0;
     pollValueScreen();
@@ -744,6 +875,7 @@ async function pollValueScreen() {
   }
 
   state.lastValueRun = r;
+  state.valueChanges = r.changes || null;
   renderValueStatus(r);
 
   if (r.status === "running") {
@@ -776,6 +908,11 @@ async function pollValueScreen() {
   $("#value-meta").textContent =
     `最近完成 ${fmtTime(r.created_at)} · 池 ${r.universe ?? "?"} · 评估 ${r.evaluated ?? "?"} · 入榜 ${r.qualifying ?? 0}`;
   let html = "";
+  const ch = r.changes;
+  if (ch && ((ch.entered || []).length || (ch.exited || []).length)) {
+    const exitedTxt = (ch.exited || []).map((x) => x.name || x.code).join("、") || "无";
+    html += `<div class="vs-changes">轮动：较上次运行 <b class="up">新进 ${(ch.entered || []).length}</b> · <b class="down">跌出 ${(ch.exited || []).length}</b><span class="muted">（跌出：${esc(exitedTxt)}）</span></div>`;
+  }
   if (picks.length) {
     html += `<h3 style="margin:4px 0 10px">✅ 价值精选（≥${picks[picks.length-1]?.score ?? 0}分）</h3>`;
     html += picks.map((p, i) => valuePickCard(p, i)).join("");
@@ -823,7 +960,7 @@ async function renderValueHistory() {
       <td><span class="badge ${h.status}">${STATUS_TEXT[h.status] || h.status}</span></td>
       <td>${h.universe ?? "—"}</td><td>${h.evaluated ?? "—"}</td>
       <td>${h.qualifying ?? "—"}</td>
-      <td>${h.top_score != null ? h.top_score + "/16" : "—"}</td></tr>`).join("") + `</table>`;
+      <td>${h.top_score != null ? h.top_score : "—"}</td></tr>`).join("") + `</table>`;
 }
 
 async function enrichPicksWithAgentLinks(picks) {
@@ -852,13 +989,17 @@ function valuePickCard(p, idx, muted = false) {
     const val = v.value != null ? v.value : "N/A";
     return `<span class="vs-metric ${cls}">${esc(k)}: <b>${val}</b> (${v.score})</span>`;
   }).join("");
+  const futChip = p.futures_context
+    ? `<span class="vs-metric">🛢 ${esc(p.futures_context)}</span>` : "";
+  const entered = (state.valueChanges?.entered || []).includes(p.code)
+    ? `<span class="badge entered">新进</span>` : "";
   return `<div class="pick-card"${muted ? ' style="opacity:.82"' : ""}>
     <div class="pick-head">
       <div class="pick-rank">${idx+1}</div>
       <span class="pick-ticker">${esc(p.code)}</span>
-      <span>${esc(p.name)}</span>
+      <span>${esc(p.name)}</span>${entered}
       <span class="pick-price">¥${(p.price ?? 0).toFixed(2)}</span>
-      <span class="muted" style="font-size:12px">${esc(p.period || "")}</span>
+      <span class="muted" style="font-size:12px">${esc(valuePeriodText(p.period))}</span>
       <div class="pick-prob">
         <div class="num">${p.score}/${p.max_score}</div>
         <div class="lbl">综合评分</div>
@@ -866,7 +1007,7 @@ function valuePickCard(p, idx, muted = false) {
       <button class="btn small primary" onclick="event.stopPropagation();deepResearch('${p.code}')">🔬 深度研究</button>
     </div>
     <div class="prob-bar"><i style="width:${pct}%"></i></div>
-    <div class="factor-chips">${chips}</div>
+    <div class="factor-chips">${chips}${futChip}</div>
   </div>`;
 }
 

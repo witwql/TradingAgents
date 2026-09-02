@@ -1,4 +1,5 @@
-"""Global macro factor tools: gold, crude oil, US Treasury yields, US equities.
+"""Global macro factor tools: gold, crude oil, US Treasury yields, US equities,
+plus a 15-symbol global+domestic futures basket.
 
 Powers the optional Global Macro Analyst with hard numbers instead of vibes.
 All series are Sina/中债-sourced (the unthrottled host family), keyless, and
@@ -8,11 +9,18 @@ The quantitative centerpiece is :func:`get_factor_exposure`, which regresses
 the target's daily returns against each factor's PREVIOUS-day move (overnight
 transmission into the A-share session), producing correlations, betas and a
 composite overnight factor score the analyst can cite.
+
+The futures basket (:func:`futures_snapshot`) is also consumed outside the
+agent graph: the momentum screener derives its F7 相关期货利多脉冲 factor
+from it, and the value screener annotates picks with their mapped futures'
+moves. One basket, one cache, three consumers.
 """
 
 import contextlib
 import io
 import logging
+import threading
+import time
 from typing import Annotated
 
 import pandas as pd
@@ -86,11 +94,38 @@ def _fmt_pct(v: float | None) -> str:
     return f"{v:+.2f}%" if v is not None else "N/A"
 
 
+def _graceful(fn):
+    """Tool bodies must never raise through ToolNode.
+
+    A vendor outage is a note for the analyst, not a dead run — a
+    NoMarketDataError from get_money_flow (EM throttled + THS snapshot miss)
+    once killed the whole graph at the macro stage. Every macro tool returns
+    either real data or an explicit "unavailable" sentinel the LLM is told to
+    cite honestly instead of fabricating numbers.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("macro tool %s degraded: %s", fn.__name__, exc)
+            return (
+                f"<{fn.__name__} 数据暂不可用：{type(exc).__name__}>\n"
+                "请在报告中注明该数据源缺失，基于其余可用数据继续分析；"
+                "严禁虚构该数据源的具体数字。"
+            )
+
+    return wrapper
+
+
 # ---------------------------------------------------------------------------
 # Individual factor tools
 # ---------------------------------------------------------------------------
 
 @tool
+@_graceful
 def get_gold_price(
     curr_date: Annotated[str, "analysis date YYYY-MM-DD"],
     lookback_days: Annotated[int, "calendar days of history to include"] = 30,
@@ -113,6 +148,7 @@ def get_gold_price(
 
 
 @tool
+@_graceful
 def get_crude_oil_price(
     curr_date: Annotated[str, "analysis date YYYY-MM-DD"],
     lookback_days: Annotated[int, "calendar days of history to include"] = 30,
@@ -135,6 +171,7 @@ def get_crude_oil_price(
 
 
 @tool
+@_graceful
 def get_us_treasury_yields(
     curr_date: Annotated[str, "analysis date YYYY-MM-DD"],
     lookback_days: Annotated[int, "calendar days of history to include"] = 60,
@@ -175,6 +212,7 @@ _US_INDICES = [(".INX", "标普500"), (".IXIC", "纳斯达克"), (".DJI", "道�
 
 
 @tool
+@_graceful
 def get_us_stock_indices(
     curr_date: Annotated[str, "analysis date YYYY-MM-DD"],
     lookback_days: Annotated[int, "calendar days of history to include"] = 30,
@@ -206,10 +244,138 @@ def get_us_stock_indices(
 
 
 # ---------------------------------------------------------------------------
+# Global futures basket — one snapshot, three consumers (factor exposure,
+# momentum screener F7, value screener annotations).
+# ---------------------------------------------------------------------------
+
+_FUTURES_FOREIGN = [
+    ("GC", "COMEX黄金"), ("SI", "COMEX白银"), ("HG", "COMEX铜"),
+    ("CL", "NYMEX原油"), ("NG", "NYMEX天然气"),
+]
+_FUTURES_DOMESTIC = [
+    ("AU0", "沪金"), ("AG0", "沪银"), ("CU0", "沪铜"), ("AL0", "沪铝"),
+    ("ZN0", "沪锌"), ("RB0", "螺纹钢"), ("I0", "铁矿石"),
+    ("M0", "豆粕"), ("JM0", "焦煤"), ("LH0", "生猪"),
+]
+_FUTURES_NAMES = {**dict(_FUTURES_FOREIGN), **dict(_FUTURES_DOMESTIC)}
+_FOREIGN_FUTURES_KEYS = {k for k, _ in _FUTURES_FOREIGN}
+
+# Best-effort stock-name → futures mapping. Only unambiguous commodity words
+# ("金" alone would false-match 金风科技/金地集团); misses (e.g. 温氏股份)
+# simply mean no futures factor for that stock.
+_STOCK_FUTURES_KEYWORDS = [
+    (("黄金", "金矿"), ("AU0", "GC")),
+    (("白银",), ("AG0", "SI")),
+    (("铜",), ("CU0", "HG")),
+    (("铝",), ("AL0",)),
+    (("锌",), ("ZN0",)),
+    (("钢",), ("RB0",)),
+    (("铁矿", "矿业", "矿"), ("I0", "AU0", "CU0")),
+    (("石油", "石化", "油田", "油服", "油气", "海油"), ("CL",)),
+    (("天然气", "燃气"), ("NG",)),
+    (("煤", "焦"), ("JM0",)),
+    (("猪", "牧", "养殖", "饲料"), ("LH0", "M0")),
+    (("豆粕", "豆", "粮油", "种业"), ("M0",)),
+]
+
+_FUTURES_CACHE: dict[str, pd.Series] = {}
+_FUTURES_CACHE_TS = 0.0
+_FUTURES_CACHE_TTL = 6 * 3600     # daily bars: refresh twice a session at most
+_FUTURES_CACHE_LOCK = threading.Lock()
+
+
+def stock_futures_map(name: str) -> list[str]:
+    """Basket keys whose commodity plausibly drives this stock, by name.
+
+    Best effort by design: a miss means the stock simply gets no futures
+    factor, never a wrong one — keyword rules favor precision over recall.
+    """
+    cleaned = str(name).replace("*ST", "").replace("ST", "").strip()
+    keys: list[str] = []
+    for words, futures in _STOCK_FUTURES_KEYWORDS:
+        if any(w in cleaned for w in words):
+            keys.extend(futures)
+    return sorted(dict.fromkeys(keys))
+
+
+def _fetch_futures_close(key: str) -> pd.Series:
+    """Full-history daily close series for one basket symbol (Sina-sourced)."""
+    if key in _FOREIGN_FUTURES_KEYS:
+        raw = _quiet(ak.futures_foreign_hist, symbol=key)
+        dates = pd.to_datetime(raw["date"], errors="coerce")
+        close = pd.to_numeric(raw["close"], errors="coerce")
+    else:
+        raw = _quiet(ak.futures_main_sina, symbol=key)
+        dates = pd.to_datetime(raw["日期"], errors="coerce")
+        close = pd.to_numeric(raw["收盘价"], errors="coerce")
+    return pd.Series(close.values, index=dates).dropna().sort_index()
+
+
+def futures_snapshot(curr_date: str | None = None) -> dict[str, dict]:
+    """Per-symbol close series + 1d/5d/20d moves, look-ahead filtered.
+
+    The raw series are cached process-wide (daily bars change at most once
+    per session); ``curr_date`` windowing happens per call, so backtest runs
+    never see future bars. Symbols that fail to fetch are simply absent —
+    every consumer treats missing keys as "no futures context".
+    """
+    global _FUTURES_CACHE, _FUTURES_CACHE_TS
+    now = time.time()
+    with _FUTURES_CACHE_LOCK:
+        if not _FUTURES_CACHE or now - _FUTURES_CACHE_TS > _FUTURES_CACHE_TTL:
+            fresh: dict[str, pd.Series] = {}
+            for key, name in _FUTURES_FOREIGN + _FUTURES_DOMESTIC:
+                try:
+                    fresh[key] = _fetch_futures_close(key)
+                except Exception as exc:
+                    logger.warning("futures snapshot %s(%s) unavailable: %s", key, name, exc)
+            if fresh:
+                _FUTURES_CACHE = fresh
+                _FUTURES_CACHE_TS = now
+            else:
+                logger.warning("futures snapshot: every basket symbol failed")
+
+    cutoff = pd.Timestamp(curr_date) if curr_date else pd.Timestamp.max
+    out: dict[str, dict] = {}
+    for key, close in _FUTURES_CACHE.items():
+        windowed = close[close.index <= cutoff]
+        if windowed.empty:
+            continue
+        out[key] = {
+            "name": _FUTURES_NAMES.get(key, key),
+            "kind": "global" if key in _FOREIGN_FUTURES_KEYS else "domestic",
+            "close": windowed,
+            "moves": {
+                "1d": _pct_change(windowed),
+                "5d": _chg_over(windowed, 5),
+                "20d": _chg_over(windowed, 20),
+            },
+        }
+    return out
+
+
+def futures_context_line(name: str, snapshot: dict[str, dict]) -> str | None:
+    """Human-readable futures context for one stock name, or None."""
+    parts = []
+    for key in stock_futures_map(name):
+        info = snapshot.get(key)
+        if not info:
+            continue
+        mv = info["moves"]
+        one = f"{mv['1d']:+.2f}%" if mv["1d"] is not None else "N/A"
+        five = f"{mv['5d']:+.2f}%" if mv["5d"] is not None else "N/A"
+        parts.append(f"{info['name']} 日{one}/5日{five}")
+        if len(parts) >= 2:
+            break
+    return "；".join(parts) if parts else None
+
+
+# ---------------------------------------------------------------------------
 # Money flow (主力资金) — EastMoney per-stock daily history
 # ---------------------------------------------------------------------------
 
 @tool
+@_graceful
 def get_money_flow(
     symbol: Annotated[str, "A-share ticker, e.g. 600519.SS"],
     curr_date: Annotated[str, "analysis date YYYY-MM-DD"],
@@ -273,18 +439,18 @@ def _factor_returns(symbol: str, curr_date: str, lookback_days: int) -> dict[str
 
     The shift encodes the transmission timing the model assumes: an overseas
     session move on A-share day t-1 evening shows up as an influence on day t.
+    Futures come from the shared basket snapshot (process-cached); the rest
+    are the macro/microflow factors.
     """
     out: dict[str, pd.Series] = {}
 
-    raw = _quiet(ak.futures_foreign_hist, symbol="GC")
-    df = _window(raw, "date", curr_date, lookback_days * 2)
-    s = pd.to_numeric(df["close"], errors="coerce").pct_change() * 100
-    out["GOLD"] = pd.Series(s.values, index=pd.to_datetime(df["date"])).shift(1)
-
-    raw = _quiet(ak.futures_foreign_hist, symbol="CL")
-    df = _window(raw, "date", curr_date, lookback_days * 2)
-    s = pd.to_numeric(df["close"], errors="coerce").pct_change() * 100
-    out["CRUDE"] = pd.Series(s.values, index=pd.to_datetime(df["date"])).shift(1)
+    snap = futures_snapshot(curr_date)
+    for key in _FUTURES_NAMES:  # basket order, not fetch order
+        info = snap.get(key)
+        if info is None:
+            continue
+        s = info["close"].pct_change() * 100
+        out[key] = pd.Series(s.values, index=info["close"].index).shift(1)
 
     raw = _quiet(ak.bond_zh_us_rate, start_date=(pd.Timestamp(curr_date) - pd.Timedelta(days=lookback_days * 2)).strftime("%Y%m%d"))
     df = _window(raw, "日期", curr_date, lookback_days * 2).dropna(subset=["美国国债收益率10年"])
@@ -316,8 +482,11 @@ def to_bare(symbol: str) -> str:
 
 
 _FACTOR_LABELS = {
-    "GOLD": "国际金价",
-    "CRUDE": "国际原油",
+    "GC": "COMEX黄金", "SI": "COMEX白银", "HG": "COMEX铜",
+    "CL": "NYMEX原油", "NG": "NYMEX天然气",
+    "AU0": "沪金", "AG0": "沪银", "CU0": "沪铜", "AL0": "沪铝",
+    "ZN0": "沪锌", "RB0": "螺纹钢", "I0": "铁矿石", "M0": "豆粕",
+    "JM0": "焦煤", "LH0": "生猪",
     "US10Y": "美债10Y收益率",
     "SPX": "美股标普500",
     "MFLOW": "主力资金净占比",
@@ -325,6 +494,7 @@ _FACTOR_LABELS = {
 
 
 @tool
+@_graceful
 def get_factor_exposure(
     symbol: Annotated[str, "target ticker, e.g. 600519.SS or 510300.SS"],
     curr_date: Annotated[str, "analysis date YYYY-MM-DD"],
@@ -378,6 +548,17 @@ def get_factor_exposure(
     for label, corr, beta, strength, _c in rows:
         lines.append(f"| {label} | {corr} | {beta} | {strength} |")
 
+    # Futures the stock actually tracks, so the analyst reads 2 rows not 15.
+    significant_futures = sorted(
+        ((r[0], r[1], r[4]) for r in rows
+         if r[0] in {v for k, v in _FACTOR_LABELS.items() if k not in ("US10Y", "SPX", "MFLOW")}
+         and isinstance(r[4], float) and abs(r[4]) >= 0.15),
+        key=lambda r: -abs(r[2]),
+    )
+    if significant_futures:
+        top = "、".join(f"{label} (r={corr})" for label, corr, _ in significant_futures[:3])
+        lines += ["", f"**与该标的联动最强的期货: {top}** —— 传导分析以下方 β 与最新变动为准。"]
+
     if weight_sum:
         lines += [
             "",
@@ -389,14 +570,16 @@ def get_factor_exposure(
                 lines.append(f"- {_FACTOR_LABELS[key]} 最新变动: {move:+.2f} → 贡献 "
                              f"{'偏多' if move * _beta_sign(rows, _FACTOR_LABELS[key]) > 0 else '偏空'}")
     else:
-        lines += ["", "四个因子与该标的的历史相关性均为噪声级——宏观因子解释力弱，"
-                      "请以标的自身动量与基本面为主。"]
+        lines += ["", "全部因子（含期货篮子）与该标的的历史相关性均为噪声级——"
+                      "宏观因子解释力弱，请以标的自身动量与基本面为主。"]
 
     lines += [
         "",
-        "解读指引：金价上行通常利多黄金/避险资产、压制风险偏好；油价上行抬升"
-        "航空/物流成本、利多上游资源；美债收益率上行压制成长股估值并影响红利"
-        "资产相对吸引力；美股隔夜表现主导A股开盘情绪与风险偏好。",
+        "解读指引：金价/沪金上行利多黄金股、压制风险偏好；铜铝锌等工业金属上行"
+        "利多对应有色冶炼与矿采股；油价上行抬升航空/物流/炼化下游成本、利多上游"
+        "油气资源；螺纹钢/铁矿石上行利多钢铁链（矿强钢弱时钢厂利润受挤压）；豆粕"
+        "上行抬升养殖饲料成本；焦煤上行抬升焦炭/钢铁成本；美债收益率上行压制成长"
+        "股估值；美股隔夜表现主导A股开盘情绪与风险偏好。",
     ]
     return "\n".join(lines)
 
@@ -412,9 +595,12 @@ def _beta_sign(rows: list, label: str) -> int:
 
 
 __all__ = [
+    "futures_context_line",
+    "futures_snapshot",
     "get_crude_oil_price",
     "get_factor_exposure",
     "get_gold_price",
     "get_us_stock_indices",
     "get_us_treasury_yields",
+    "stock_futures_map",
 ]

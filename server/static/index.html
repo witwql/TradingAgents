@@ -4,7 +4,7 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>TradingAgents Dashboard - 多智能体股票分析</title>
-<link rel="stylesheet" href="/static/style.css?v=20260901a"/>
+<link rel="stylesheet" href="/static/style.css?v=20260901b"/>
 </head>
 <body>
 <header class="topbar">
@@ -187,6 +187,26 @@
     <table class="tbl clickable" id="fav-table"></table>
   </section>
 
+  <!-- ============ 期货行情 ============ -->
+  <section data-view="futures" class="view">
+    <div class="tasks-head">
+      <h2>期货行情</h2>
+      <div class="seg" id="futures-cats">
+        <button class="seg-btn active" data-cat="all">全部</button>
+        <button class="seg-btn" data-cat="commodity">商品</button>
+        <button class="seg-btn" data-cat="financial">金融</button>
+        <button class="seg-btn" data-cat="global">国际</button>
+      </div>
+      <div class="seg" id="futures-sort">
+        <button class="seg-btn active" data-sort="desc">涨幅优先</button>
+        <button class="seg-btn" data-sort="asc">跌幅优先</button>
+      </div>
+    </div>
+    <p class="muted" id="futures-note" style="font-size:12.5px">数据来源：新浪财经 · 主力连续合约 ·
+      涨跌幅以昨结算价为基准（中金所为昨收盘价）· <span id="futures-meta"></span></p>
+    <table class="tbl" id="futures-table"></table>
+  </section>
+
   <!-- ============ 设置 ============ -->
   <section data-view="settings" class="view">
     <h2>设置</h2>
@@ -229,9 +249,9 @@ ZHIPU_API_KEY=你的密钥       # 国际站 Z.AI
 </aside>
 
 <footer class="foot muted">
-  学习研究用途 · 输出为 AI 生成的分析报告，不构成任何投资建议 · 数据来源：东方财富/AKShare
+  学习研究用途 · 输出为 AI 生成的分析报告，不构成任何投资建议 · 数据来源：东方财富/AKShare/新浪财经
 </footer>
 
-<script src="/static/app.js?v=20260901a"></script>
+<script src="/static/app.js?v=20260901b"></script>
 </body>
 </html>

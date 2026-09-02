@@ -98,3 +98,35 @@ def test_env_override_sets_config(monkeypatch):
     # None-default key: env value arrives as a string and is coerced downstream.
     assert dc.DEFAULT_CONFIG["llm_max_retries"] == "8"
     assert _coerce_max_retries(dc.DEFAULT_CONFIG["llm_max_retries"]) == 8
+
+
+# --- llm_timeout: per-request cap so a wedged connection raises (then the
+# --- langgraph retry policy gets its chance) instead of stalling forever -----
+
+@pytest.mark.unit
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "google"])
+def test_timeout_forwarded_across_providers(provider):
+    kwargs = _bare_graph({"llm_provider": provider, "llm_timeout": 300})._get_provider_kwargs()
+    assert kwargs["timeout"] == 300.0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("disabled", [None, 0, ""])
+def test_timeout_not_forwarded_when_disabled(disabled):
+    kwargs = _bare_graph({"llm_provider": "openai", "llm_timeout": disabled})._get_provider_kwargs()
+    assert "timeout" not in kwargs
+
+
+@pytest.mark.unit
+def test_timeout_default_is_bounded(monkeypatch):
+    dc = _reload_with_env(monkeypatch)
+    assert dc.DEFAULT_CONFIG["llm_timeout"] == 600
+
+
+@pytest.mark.unit
+def test_timeout_env_override(monkeypatch):
+    dc = _reload_with_env(monkeypatch, TRADINGAGENTS_LLM_TIMEOUT="300")
+    # int-default key: env coercion yields an int.
+    assert dc.DEFAULT_CONFIG["llm_timeout"] == 300
+    kwargs = _bare_graph({"llm_provider": "openai", **dc.DEFAULT_CONFIG})._get_provider_kwargs()
+    assert kwargs["timeout"] == 300.0

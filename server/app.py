@@ -12,6 +12,7 @@ GET  /api/tasks/{id}/events  Server-Sent Events stream (replays history first)
 GET  /api/tasks/{id}/reports    report-tree manifest (markdown files)
 GET  /api/tasks/{id}/report?path=  raw markdown content of one report file
 GET/POST/DELETE /api/favorites
+GET  /api/futures          futures board: realtime quotes + daily trends (Sina)
 GET/PUT /api/settings      non-secret runtime knobs (GLM region/model etc.)
 """
 
@@ -170,8 +171,10 @@ def _normalize_bus_event(ev: dict) -> dict:
 
 
 def create_app(db: Database | None = None, queue: TaskQueue | None = None,
-               start_spot: bool = True, args_db_path: str | None = None) -> FastAPI:
+               start_spot: bool = True, args_db_path: str | None = None,
+               start_futures: bool = True) -> FastAPI:
     from .events import EventBus
+    from .futures import FuturesBoard
 
     db = db or Database()
     db_path = args_db_path if args_db_path else default_db_path()
@@ -184,6 +187,9 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
     )
     if start_spot:
         spot_cache.start()
+    futures_board = FuturesBoard()
+    if start_futures:
+        futures_board.start()
 
     from .scheduler import ScreeningScheduler
 
@@ -211,6 +217,7 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
     app.state.queue = queue
     app.state.bus = bus
     app.state.spot = spot_cache
+    app.state.futures = futures_board
 
     # ------------------------------------------------------------------ meta
     @app.get("/api/health")
@@ -424,6 +431,12 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
         db.remove_favorite(bare)
         return {"removed": bare}
 
+    # ---------------------------------------------------------------- futures
+    @app.get("/api/futures")
+    def futures_board():
+        """期货板块：实时行情（新浪，涨跌幅以昨结算为基准）+ 40日收盘走势。"""
+        return app.state.futures.snapshot()
+
     # --------------------------------------------------------------- screener
     @app.post("/api/screen", status_code=202)
     def screen_start():
@@ -460,11 +473,18 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
 
     @app.get("/api/value-screen/latest")
     def value_screen_latest():
-        from .value_screener import latest_value_run
+        from .value_screener import latest_value_run, value_run_changes
 
         run = latest_value_run(db)
         if not run:
             return {"run": None}
+        picks = (run["results"] or {}).get("picks", [])
+        changes = None
+        if run["status"] == "done" and picks:
+            try:
+                changes = value_run_changes(db, run["id"], picks)
+            except Exception:
+                logger.exception("value run changes computation failed")
         return {
             "run": {
                 "id": run["id"],
@@ -479,8 +499,9 @@ def create_app(db: Database | None = None, queue: TaskQueue | None = None,
                 "error": run["error"],
                 "evaluated": (run["results"] or {}).get("evaluated"),
                 "qualifying": (run["results"] or {}).get("qualifying"),
-                "picks": (run["results"] or {}).get("picks", []),
+                "picks": picks,
                 "watchlist": (run["results"] or {}).get("watchlist", []),
+                "changes": changes,
             }
         }
 

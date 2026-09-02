@@ -48,6 +48,14 @@ _ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 # investing trend more measured. Caller can override.
 DEFAULT_SUBREDDITS = ("wallstreetbets", "stocks", "investing")
 
+# Circuit breaker: when every subreddit request fails on the network (SSL
+# handshake timeout, unreachable host — the permanent case behind some
+# firewalls), skip the doomed requests entirely for a while instead of paying
+# 3 × timeout every run. A single failed sub among successful others does NOT
+# trip it; a successful fetch clears it.
+_COOLDOWN_SECONDS = 600
+_fail_until = 0.0
+
 
 def _search_qs(ticker: str, limit: int) -> str:
     return urlencode({
@@ -103,6 +111,9 @@ def _fetch_subreddit_rss(
     post is tagged ``source="rss"`` for honest display. On a 429 (Reddit's
     per-IP rate limit) we back off once — honouring ``Retry-After`` when
     present — before giving up, so a transient burst doesn't blank the feed.
+
+    Returns None on a network/HTTP failure (distinct from an empty-but-alive
+    feed, which returns []) so the caller can distinguish an outage.
     """
     url = _RSS.format(sub=sub, qs=_search_qs(ticker, limit))
     req = Request(url, headers={"User-Agent": _UA})
@@ -119,12 +130,12 @@ def _fetch_subreddit_rss(
             time.sleep(wait)
             return _fetch_subreddit_rss(ticker, sub, limit, timeout, _retry=False)
         logger.warning("Reddit RSS fetch failed for r/%s · %s: %s", sub, ticker, exc)
-        return []
+        return None
     except (OSError, http.client.HTTPException, ET.ParseError) as exc:
         # OSError covers URLError/TimeoutError/connection resets; HTTPException
         # covers chunked-transfer errors (IncompleteRead/BadStatusLine, #1024).
         logger.warning("Reddit RSS fetch failed for r/%s · %s: %s", sub, ticker, exc)
-        return []
+        return None
 
     posts = []
     for entry in root.findall("atom:entry", _ATOM_NS)[:limit]:
@@ -204,13 +215,25 @@ def fetch_reddit_posts(
     """
     # Crypto reaches us as a Yahoo pair (BTC-USD); search Reddit for the base
     # ("BTC") so the query actually matches discussion instead of near-nothing.
+    global _fail_until
     ticker = crypto_base(ticker) or ticker
+    subreddits = list(subreddits)
+    if time.time() < _fail_until:
+        return (
+            f"<Reddit unavailable: circuit-breaker open after every subreddit "
+            f"request failed; retrying after {_COOLDOWN_SECONDS}s window>"
+        )
+
     blocks = []
     total_posts = 0
+    failed_subs = 0
     for i, sub in enumerate(subreddits):
         if i > 0:
             time.sleep(inter_request_delay)
         posts = _fetch_subreddit(ticker, sub, limit_per_sub, timeout)
+        if posts is None:
+            failed_subs += 1
+            posts = []
         total_posts += len(posts)
         if not posts:
             blocks.append(f"r/{sub}: <no posts found mentioning {ticker.upper()} in the past 7 days>")
@@ -242,9 +265,20 @@ def fetch_reddit_posts(
             )
         blocks.append("\n".join(lines))
 
+    if failed_subs and failed_subs == len(subreddits) and total_posts == 0:
+        _fail_until = time.time() + _COOLDOWN_SECONDS
+        logger.warning("Reddit unreachable for all %d subreddits — cooling down %ss",
+                       failed_subs, _COOLDOWN_SECONDS)
+        return (
+            f"<Reddit unreachable (network) across "
+            f"{', '.join(f'r/{s}' for s in subreddits)}; circuit-breaker open for "
+            f"{_COOLDOWN_SECONDS}s>"
+        )
+
     if total_posts == 0:
         return (
             f"<no Reddit posts found mentioning {ticker.upper()} across "
             f"{', '.join(f'r/{s}' for s in subreddits)} in the past 7 days>"
         )
+    _fail_until = 0.0
     return "\n\n".join(blocks)

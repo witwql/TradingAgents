@@ -11,6 +11,7 @@ outcomes (a "Yes" at 0.76 means the market prices a 76% chance).
 """
 import json
 import logging
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -24,6 +25,13 @@ REQUEST_TIMEOUT = 30
 
 # Default number of markets to return, ranked by traded volume.
 DEFAULT_LIMIT = 6
+
+# Circuit breaker: the news/macro analysts fire several topic searches per
+# run; when the host is unreachable (each attempt burns the full read timeout)
+# the first failure opens a cooldown during which every search returns the
+# unavailable note instantly. A successful search clears it.
+_COOLDOWN_SECONDS = 600
+_fail_until = 0.0
 
 
 def _request(path: str, params: dict) -> dict:
@@ -56,7 +64,13 @@ def _is_forward_looking(market: dict, now: datetime) -> bool:
     end_date = market.get("endDate")
     if end_date:
         try:
-            if datetime.fromisoformat(end_date.replace("Z", "+00:00")) < now:
+            end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            # Some markets carry a bare date ("2026-12-31") — naive until made
+            # aware; comparing it against aware ``now`` used to raise TypeError
+            # straight through the tool call.
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=timezone.utc)
+            if end < now:
                 return False
         except ValueError:
             pass
@@ -82,15 +96,24 @@ def get_prediction_markets(topic: str, limit: int | None = None) -> str:
     if limit is None:
         limit = DEFAULT_LIMIT
 
+    global _fail_until
+    unavailable = (
+        "Polymarket data is currently unavailable ({reason}). "
+        "Proceed without prediction-market signal for '{topic}'."
+    )
+    if time.time() < _fail_until:
+        return unavailable.format(reason="circuit-breaker open after a network failure",
+                                  topic=topic)
+
     try:
         data = _request("public-search", {"q": topic, "limit_per_type": 20})
     except requests.RequestException as e:
-        logger.warning("Polymarket search failed for %r: %s", topic, e)
-        return (
-            f"Polymarket data is currently unavailable (network error: {e}). "
-            f"Proceed without prediction-market signal for '{topic}'."
-        )
+        _fail_until = time.time() + _COOLDOWN_SECONDS
+        logger.warning("Polymarket search failed for %r: %s — cooling down %ss",
+                       topic, e, _COOLDOWN_SECONDS)
+        return unavailable.format(reason=f"network error: {e}", topic=topic)
 
+    _fail_until = 0.0
     now = datetime.now(timezone.utc)
     candidates = [
         m
