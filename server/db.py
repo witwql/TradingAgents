@@ -314,9 +314,13 @@ class Database:
     def sweep_interrupted(self, max_running_age: float = 1800) -> dict[str, int]:
         """Fail stale 'running' rows left by a server restart/crash.
 
-        A running screening older than ``max_running_age`` and any running
-        analysis task cannot still be alive after a fresh boot; marking them
-        here prevents UIs from waiting on ghosts forever.
+        A running screening older than ``max_running_age`` — and ANY running
+        analysis task, whatever its age — cannot still be alive after a fresh
+        boot: workers die with their process and no worker ever claims a
+        'running' row. Filtering tasks by age here let freshly restarted ghosts
+        through (a task 27 min into a hang, server restarted at minute 28, UI
+        stuck on 运行中 forever); marking them here prevents UIs from waiting
+        on ghosts forever.
         """
         now = time.time()
         counts = {"screen_runs": 0, "tasks": 0, "value_runs": 0}
@@ -333,10 +337,12 @@ class Database:
                 (now, now - max_running_age),
             )
             counts["value_runs"] = cur.rowcount
+            # 任务不限年龄：新进程里没有任何 worker 持有 running 行，
+            # 不管任务多新都是上个进程的遗骸（幽灵任务事故的根因）。
             cur = self._conn.execute(
                 "UPDATE tasks SET status='failed', error='服务重启，运行中断',"
-                " finished_at=? WHERE status='running' AND started_at < ?",
-                (now, now - max_running_age),
+                " finished_at=? WHERE status='running'",
+                (now,),
             )
             counts["tasks"] = cur.rowcount
             self._conn.commit()

@@ -8,6 +8,24 @@ Breaking changes within the 0.x line are called out explicitly.
 
 ## Unreleased
 
+### Fixed
+- **个股分析挂死/幽灵任务**（用户观察：任务运行半小时仍显示"分析中"，且频繁失败）：
+  根因是思考型模型（glm-5.3-flash）非流式请求会独占一条静默连接 5-8 分钟，网关
+  会在这种连接上挂死（实测合法生成 450s/17592 个流式 chunk，块间最大间隔仅 1.4s）；
+  叠加 openai SDK 默认 2 次静默重试（llm_timeout 600s × 3 ≈ 30 分钟无任何事件），
+  用户重启服务后，启动清扫的 30 分钟年龄过滤又放走了刚重启时的 running 行 →
+  UI 永久显示"运行中"的幽灵任务。修复：
+  - OpenAI 兼容家族默认**流式调用**（`llm_streaming`，env `TRADINGAGENTS_LLM_STREAMING`
+    可关）——字节持续流动使超时按"块间隔"而非"整请求"生效：健康的慢调用畅通，
+    挂死连接快速可见地报错；
+  - 流式调用增加**总时长上限**（块间隔超时的 4×，默认 20 分钟）：实测存在
+    推理死循环（风险辩论某调用流式跑了 33+ 分钟、chunk 持续到达、块间隔超时
+    永不触发）；超限在流内部抛错，`llm_error` 事件正常发出、任务可见失败；
+  - `llm_max_retries` 默认 None→1：SDK 静默重试最多一次，最坏静默 30→10 分钟；
+  - `db.sweep_interrupted` 启动时清扫**所有** running 任务（不再按年龄过滤）——
+    新进程不可能拥有旧进程的 worker；
+  - `llm_timeout` 默认 600→300s（配合流式按块间隔生效）。
+
 ### Added
 - **期货行情板块**（Dashboard 新菜单页）：68 个主力连续合约的实时行情与
   40 日收盘走势，全部来自新浪财经（与自选股行情同一 Referer 门禁来源）。

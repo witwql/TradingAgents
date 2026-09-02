@@ -40,6 +40,7 @@ from tradingagents.dataflows.global_macro import (
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_llm_client
+from tradingagents.llm_clients.openai_client import is_openai_compatible
 from tradingagents.reporting import write_report_tree
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
@@ -215,6 +216,18 @@ class TradingAgentsGraph:
             timeout = float(timeout)
             if timeout > 0:
                 kwargs["timeout"] = timeout
+
+        # Stream by default on the OpenAI-compatible family: thinking models
+        # (glm-5.3-flash et al.) legitimately generate for 5-8 min, and a
+        # non-streaming request holds one silent connection the whole time —
+        # gateways/LBs blackhole exactly such connections (the "analysis stuck
+        # for half an hour" incident). Streaming keeps bytes flowing (observed
+        # max chunk gap 1.4s over a 7.5-min generation), so the per-request
+        # timeout degrades to a per-chunk idle timeout: healthy slow calls pass,
+        # wedged connections still error out and become visible. langchain
+        # aggregates the chunks inside invoke(), so callers see no difference.
+        if self.config.get("llm_streaming", True) and is_openai_compatible(provider):
+            kwargs["streaming"] = True
 
         return kwargs
 

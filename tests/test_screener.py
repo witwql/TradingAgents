@@ -369,16 +369,21 @@ class TestInterruptedSweepAndCancel:
             "INSERT INTO screen_runs (id, created_at, status) VALUES ('fresh', ?, 'running')",
             (_t.time(),),
         )
-        # 分析任务同理
-        tid = db.create_task({"ticker": "600519", "trade_date": "2026-08-28"})
-        db.update_task(tid, status="running", started_at=_t.time() - 7200)
+        # 分析任务：新旧 running 都要清扫 —— 重启后没有任何 worker 持有
+        # running 行，年龄过滤会让刚重启时的幽灵任务永远挂在 UI 上
+        # （事故：任务挂 27 分钟后用户重启服务，任务当时"太新"未被清扫）。
+        tid_old = db.create_task({"ticker": "600519", "trade_date": "2026-08-28"})
+        db.update_task(tid_old, status="running", started_at=_t.time() - 7200)
+        tid_fresh = db.create_task({"ticker": "600938", "trade_date": "2026-09-02"})
+        db.update_task(tid_fresh, status="running", started_at=_t.time() - 60)
 
         counts = db.sweep_interrupted(max_running_age=1800)
         assert counts["screen_runs"] == 1
-        assert counts["tasks"] == 1
+        assert counts["tasks"] == 2
         assert db.fetchone("SELECT status FROM screen_runs WHERE id='old'")["status"] == "failed"
         assert db.fetchone("SELECT status FROM screen_runs WHERE id='fresh'")["status"] == "running"
-        assert db.get_task(tid)["status"] == "failed"
+        assert db.get_task(tid_old)["status"] == "failed"
+        assert db.get_task(tid_fresh)["status"] == "failed"
 
     def test_cancel_flag_request(self, tmp_path):
         from server.db import Database

@@ -31,8 +31,9 @@ DEFAULT_WORKERS = 2
 # Watchdog: a running task that emits no events for this long is wedged in a
 # call that will never return (no timeout anywhere in a vendor/SDK chain).
 # 40 min clears the quiet window of one legitimately timing-out LLM call chain
-# (default llm_timeout 600s x SDK retries 3 ≈ 30 min of silence between node
-# attempts); raise TRADINGAGENTS_TASK_MAX_IDLE alongside llm_timeout.
+# (default llm_timeout 300s x 2 attempts ≈ 10 min of silence between node
+# events, with generous slack for slow non-LLM vendors); raise
+# TRADINGAGENTS_TASK_MAX_IDLE alongside llm_timeout.
 DEFAULT_MAX_IDLE = 2400
 WATCHDOG_INTERVAL = 30.0
 

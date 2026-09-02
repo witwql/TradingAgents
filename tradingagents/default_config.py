@@ -20,6 +20,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
     "TRADINGAGENTS_LLM_TIMEOUT":          "llm_timeout",
+    "TRADINGAGENTS_LLM_STREAMING":        "llm_streaming",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
     # default). Settable here for non-interactive runs; the CLI also offers an
     # interactive choice, which is skipped when the matching var is set.
@@ -100,16 +101,30 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # variation on models that honor it; reasoning models largely ignore it
     # and no setting makes LLM output bit-identical across runs (see README).
     "temperature": None,
-    # SDK retry budget forwarded to every provider chat client. None leaves each
-    # provider/SDK at its own default (usually 2). Raise it to ride out bursty
-    # 429 throttling on rate-limited deployments instead of aborting a run (#1091).
-    "llm_max_retries": None,
+    # SDK retry budget forwarded to every provider chat client. Pinned to 1:
+    # SDK retries are silent (no callback, no event), so each retry multiplies
+    # how long a wedged connection stalls a node with zero UI feedback. 600s
+    # timeout × provider default 2 retries ≈ 30 min of silence per call — the
+    # "analysis stuck for half an hour" incident. 1 retry still rides out a
+    # bursty 429/5xx; raise via TRADINGAGENTS_LLM_MAX_RETRIES if your
+    # deployment is heavily rate-limited (#1091).
+    "llm_max_retries": 1,
     # Per-request LLM timeout in seconds, forwarded to every provider chat
     # client. Without it a wedged provider connection (request accepted,
     # response never sent) blocks the calling node forever: langgraph's node
     # retry only fires on exceptions, and with no timeout none ever comes.
-    # 600s leaves room for slow reasoning models; 0/None disables the cap.
-    "llm_timeout": 600,
+    # 300s ≈ 3.5× the slowest observed glm-5.3-flash analysis call (~84s at
+    # 10k-token context); 0/None disables the cap.
+    "llm_timeout": 300,
+    # Stream LLM calls by default on the OpenAI-compatible family (GLM,
+    # DeepSeek, Qwen, ...). Thinking models legitimately generate for 5-8 min;
+    # non-streaming requests hold one silent connection the whole time and
+    # gateways tend to drop exactly those, wedging the node (the "analysis
+    # stuck for half an hour" incident). With streaming the llm_timeout above
+    # applies per chunk gap instead of per request, so slow-but-healthy calls
+    # pass while dead connections fail visibly. Set False to restore
+    # buffered/non-streaming requests.
+    "llm_streaming": True,
     # Checkpoint/resume: when True, LangGraph saves state after each node
     # so a crashed run can resume from the last successful step.
     "checkpoint_enabled": False,

@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -11,6 +12,35 @@ from .api_key_env import get_api_key_env
 from .base_client import BaseLLMClient, normalize_content
 from .capabilities import get_capabilities
 from .validators import validate_model
+
+# Total wall-clock cap for one streaming call, relative to the per-chunk idle
+# timeout. Streaming keeps bytes flowing so healthy-but-slow generations pass
+# (observed legit max ~7.5 min), but a degenerate reasoning loop ALSO keeps
+# chunks flowing forever — no idle timeout ever fires (observed: one risk-debate
+# call streamed 33+ min with zero completion). 4× the idle timeout bounds the
+# pathology while leaving ~2.5× headroom over the slowest legit call.
+_STREAM_TOTAL_MULTIPLIER = 4
+# Floor when request_timeout is unset/disabled (0/None), so the bound survives.
+_STREAM_TOTAL_FLOOR_SECONDS = 1200.0
+
+
+def _bound_stream_seconds(chunks, deadline: float, total_seconds: float):
+    """Re-raise past a wall-clock deadline while forwarding stream chunks.
+
+    Raising *inside* the stream keeps the exception within langchain's run
+    manager context, so on_llm_error fires and the UI sees the failure —
+    unlike a wrapper-thread timeout, which silently leaks the call.
+    """
+    started = time.monotonic()
+    for chunk in chunks:
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"LLM streaming call exceeded its total time budget "
+                f"({total_seconds:.0f}s, elapsed {time.monotonic() - started:.0f}s); "
+                f"chunks were still arriving, so the generation was likely stuck "
+                f"in a reasoning loop — aborted to bound the stall."
+            )
+        yield chunk
 
 
 class NormalizedChatOpenAI(ChatOpenAI):
@@ -34,6 +64,24 @@ class NormalizedChatOpenAI(ChatOpenAI):
 
     def invoke(self, input, config=None, **kwargs):
         return normalize_content(super().invoke(input, config, **kwargs))
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        total = self._stream_total_seconds()
+        deadline = time.monotonic() + total
+        yield from _bound_stream_seconds(
+            super()._stream(messages, stop=stop, run_manager=run_manager, **kwargs),
+            deadline,
+            total,
+        )
+
+    def _stream_total_seconds(self) -> float:
+        try:
+            idle = float(self.request_timeout)
+        except (TypeError, ValueError):
+            return _STREAM_TOTAL_FLOOR_SECONDS
+        if idle <= 0:
+            return _STREAM_TOTAL_FLOOR_SECONDS
+        return idle * _STREAM_TOTAL_MULTIPLIER
 
     def with_structured_output(self, schema, *, method=None, **kwargs):
         caps = get_capabilities(self.model_name)
@@ -166,6 +214,7 @@ class MinimaxChatOpenAI(NormalizedChatOpenAI):
 _PASSTHROUGH_KWARGS = (
     "timeout", "max_retries", "reasoning_effort", "temperature",
     "api_key", "callbacks", "http_client", "http_async_client",
+    "streaming",
 )
 
 # OpenAI's ``reasoning_effort`` is only accepted by reasoning models — the GPT-5
