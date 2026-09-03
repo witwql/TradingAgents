@@ -14,14 +14,22 @@ the analysis. Payload strings are hard-truncated before they reach SQLite/SSE.
 """
 
 import logging
+import time
 
 from langchain_core.callbacks import BaseCallbackHandler
+
+from .runner import TaskAbandoned
 
 logger = logging.getLogger(__name__)
 
 INPUT_TAIL_CHARS = 220
 TEXT_TAIL_CHARS = 600
 TOOL_TAIL_CHARS = 500
+
+# Minimum spacing between llm_progress heartbeat events. Streaming LLM calls
+# emit no boundary events for their whole duration; without a heartbeat the
+# task watchdog reads a legit 5-20 min generation as a wedged worker.
+HEARTBEAT_INTERVAL = 60.0
 
 
 def _tail(value, limit):
@@ -43,6 +51,9 @@ class AgentStreamHandler(BaseCallbackHandler):
     def __init__(self, emit):
         self._emit = emit
         self._runs: dict[str, dict] = {}
+        # -inf so the very first token emits even in the first HEARTBEAT_INTERVAL
+        # seconds of process uptime, when monotonic() is still tiny.
+        self._last_heartbeat = float("-inf")
 
     # -- attribution helpers --------------------------------------------------
     @staticmethod
@@ -101,6 +112,20 @@ class AgentStreamHandler(BaseCallbackHandler):
             })
         except Exception as exc:
             logger.debug("agent stream llm_start failed: %s", exc)
+
+    def on_llm_new_token(self, token, *, run_id=None, parent_run_id=None,
+                         tags=None, metadata=None, **kwargs):
+        # Throttled heartbeat: resets the task watchdog's idle clock during a
+        # long streaming generation, which emits no boundary events otherwise.
+        now = time.monotonic()
+        if now - self._last_heartbeat < HEARTBEAT_INTERVAL:
+            return
+        self._last_heartbeat = now
+        try:
+            info = self._runs.get(str(run_id)) if run_id is not None else None
+            self._emit("llm_progress", {"node": (info or {}).get("node")})
+        except Exception:
+            logger.debug("agent stream llm_progress failed")
 
     def on_llm_error(self, error, *, run_id=None, parent_run_id=None,
                      metadata=None, **kwargs):
@@ -196,4 +221,30 @@ class AgentStreamHandler(BaseCallbackHandler):
             logger.debug("agent stream tool_end failed")
 
 
-__all__ = ["AgentStreamHandler"]
+class AbandonmentGuard(BaseCallbackHandler):
+    """Aborts a run whose task the watchdog already failed.
+
+    Unlike the stream handler, ``raise_error`` is True: the TaskAbandoned
+    raised in ``on_chat_model_start`` propagates out of the chat model
+    invocation — before any HTTP request — and unwinds the graph. This is
+    the only reliable choke point: event callbacks and the progress hook
+    swallow exceptions by design, so a wedged/abandoned worker could
+    otherwise grind through the remaining graph for hours, burning tokens
+    while its task row already reads failed.
+    """
+
+    raise_error = True
+
+    def __init__(self, is_abandoned):
+        self._is_abandoned = is_abandoned
+
+    def on_chat_model_start(self, serialized, messages, *, run_id=None,
+                            parent_run_id=None, tags=None, metadata=None,
+                            **kwargs):
+        if self._is_abandoned():
+            raise TaskAbandoned(
+                "task already failed by the watchdog; aborting the run"
+            )
+
+
+__all__ = ["AgentStreamHandler", "AbandonmentGuard"]

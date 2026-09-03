@@ -69,6 +69,14 @@ ANALYST_STAGE_KEY = {"market": "market", "social": "sentiment",
 ALL_ANALYST_KEYS = ("market", "social", "news", "fundamentals", "macro")
 
 
+class TaskAbandoned(RuntimeError):
+    """Raised to unwind a run whose task the watchdog already failed.
+
+    RuntimeError (not plain Exception) so langgraph's ``default_retry_on``
+    returns False — an abandoned task must not burn retry attempts.
+    """
+
+
 def build_stages(analysts: list[str]) -> list[tuple[str, str]]:
     """Ordered [(stage_id, label)] pipeline rows for the selected analysts."""
     stages: list[tuple[str, str]] = [
@@ -126,8 +134,13 @@ class AnalysisRunner:
             }
         return config
 
-    def run(self, task: dict, emit, db) -> dict:
+    def run(self, task: dict, emit, db, is_abandoned=None) -> dict:
         """Run the analysis. ``emit(type, payload)`` publishes SSE events.
+
+        ``is_abandoned`` — optional zero-arg predicate, polled before every LLM
+        call; when it turns True (the watchdog failed this task), the guard
+        raises :class:`TaskAbandoned` so the worker stops instead of grinding
+        through the remaining hours of graph on a task that is already failed.
 
         Returns a small result dict (rating/summary/report_dir) the queue can
         persist on success.
@@ -143,7 +156,7 @@ class AnalysisRunner:
 
         # Per-agent live feed: forward LLM/tool activity with resolved stage
         # labels so the UI groups the stream without re-mapping names.
-        from .agent_stream import AgentStreamHandler
+        from .agent_stream import AgentStreamHandler, AbandonmentGuard
 
         def stream_emit(kind: str, payload: dict):
             payload = {**payload, "stage": NODE_TO_STAGE.get(payload.get("node") or "")}
@@ -153,10 +166,13 @@ class AnalysisRunner:
         # Scoped, not global: vendor calls inside this run see exactly cfg,
         # while the screener/spot threads keep their own view of the world.
         agent_handler = AgentStreamHandler(stream_emit)
+        runtime_callbacks = [agent_handler]
+        if is_abandoned is not None:
+            runtime_callbacks.append(AbandonmentGuard(is_abandoned))
         with config_scope(cfg):
-            return self._run_analysis(task, cfg, progress, agent_handler)
+            return self._run_analysis(task, cfg, progress, runtime_callbacks)
 
-    def _run_analysis(self, task, cfg, progress, agent_handler):
+    def _run_analysis(self, task, cfg, progress, runtime_callbacks):
         ticker = task["ticker"]
         graph = TradingAgentsGraph(
             selected_analysts=tuple(
@@ -165,7 +181,7 @@ class AnalysisRunner:
             debug=False,
             config=cfg,
             progress_callback=progress,
-            runtime_callbacks=[agent_handler],
+            runtime_callbacks=runtime_callbacks,
         )
         final_state, rating = graph.propagate(ticker, task["trade_date"])
 

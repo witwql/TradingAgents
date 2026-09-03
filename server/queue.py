@@ -15,6 +15,13 @@ bottleneck, so more than ~4 workers rarely helps.
 A watchdog thread fails any running task that stops emitting events for
 ``max_idle`` seconds — a worker wedged in a call that never returns cannot
 be interrupted, but its task row and SSE stream must not hang forever.
+Streaming LLM calls emit throttled ``llm_progress`` heartbeats, so a healthy
+slow generation is not mistaken for a wedge.
+
+The verdict is also enforced worker-side: the runner polls an abandonment
+predicate before every LLM call and raises ``TaskAbandoned`` once the
+watchdog has failed the task, so the thread unwinds instead of grinding
+through the remaining graph (burning provider tokens) on a failed task.
 """
 
 import logging
@@ -22,7 +29,7 @@ import os
 import threading
 
 from .db import Database
-from .runner import ALL_ANALYST_KEYS, build_stages, format_exception
+from .runner import ALL_ANALYST_KEYS, TaskAbandoned, build_stages, format_exception
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +37,10 @@ DEFAULT_WORKERS = 2
 
 # Watchdog: a running task that emits no events for this long is wedged in a
 # call that will never return (no timeout anywhere in a vendor/SDK chain).
-# 40 min clears the quiet window of one legitimately timing-out LLM call chain
-# (default llm_timeout 300s x 2 attempts ≈ 10 min of silence between node
-# events, with generous slack for slow non-LLM vendors); raise
-# TRADINGAGENTS_TASK_MAX_IDLE alongside llm_timeout.
+# Streaming LLM calls emit llm_progress heartbeats, so the quiet window is
+# bounded by non-streaming LLM calls (llm_timeout x attempts) and slow tool
+# chains, not by the whole generation; 40 min keeps generous slack over both.
+# Raise TRADINGAGENTS_TASK_MAX_IDLE alongside llm_timeout.
 DEFAULT_MAX_IDLE = 2400
 WATCHDOG_INTERVAL = 30.0
 
@@ -171,6 +178,10 @@ class TaskQueue:
         return failed
 
     # -- worker ------------------------------------------------------------------
+    def _is_abandoned(self, task_id: str) -> bool:
+        with self._abandoned_lock:
+            return task_id in self._abandoned
+
     def _worker_loop(self):
         while not self._stop.is_set():
             task = None
@@ -211,7 +222,12 @@ class TaskQueue:
         emit("status", {"status": "running", "ticker": task["ticker"]})
         result: dict | None = None
         try:
-            result = runner.run(task, emit=emit, db=db)
+            result = runner.run(
+                task, emit=emit, db=db, is_abandoned=lambda: self._is_abandoned(task_id)
+            )
+        except TaskAbandoned:
+            logger.warning("task %s abandoned; worker stopped executing it", task_id)
+            return
         except Exception as exc:
             message = format_exception(exc)
             logger.error("task %s failed: %s", task_id, message)

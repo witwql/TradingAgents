@@ -2,15 +2,20 @@
 
 A worker blocked in a call that never returns (no timeout anywhere in a
 vendor/SDK chain) cannot be interrupted. These tests verify the watchdog
-fails such tasks from the outside and that the WHERE-guarded state writes
-keep a late-finishing worker from resurrecting its task.
+fails such tasks from the outside, that the WHERE-guarded state writes
+keep a late-finishing worker from resurrecting its task, that the worker
+actually unwinds at the next LLM boundary (AbandonmentGuard), and that
+streaming LLM calls keep the idle clock fed via heartbeat events.
 """
+import threading
 import time
 
 import pytest
 
+from server.agent_stream import AbandonmentGuard, AgentStreamHandler
 from server.db import Database
 from server.queue import TaskQueue
+from server.runner import TaskAbandoned
 
 
 @pytest.fixture()
@@ -47,7 +52,7 @@ class _LateRunner:
     def reset(self, task_id, db, stages):
         db.set_stages(task_id, [name for name, _ in stages])
 
-    def run(self, task, emit, db):
+    def run(self, task, emit, db, is_abandoned=None):
         self.calls.append(task["id"])
         emit("llm_start", {"node": "Market Analyst"})
         return {"rating": "BUY", "summary": "late outcome", "report_dir": ""}
@@ -142,3 +147,133 @@ class TestZombieWorkerGuards:
         assert db.get_task(task_id)["status"] == "completed"
         assert not db.complete_task_unless_terminal(task_id, rating="SELL", summary="x", report_dir="")
         assert db.get_task(task_id)["rating"] == "BUY"
+
+
+@pytest.mark.unit
+class TestAbandonmentGuard:
+    def test_raises_when_abandoned(self):
+        guard = AbandonmentGuard(lambda: True)
+        with pytest.raises(TaskAbandoned):
+            guard.on_chat_model_start(None, [], run_id="r1")
+
+    def test_silent_while_task_live(self):
+        guard = AbandonmentGuard(lambda: False)
+        guard.on_chat_model_start(None, [], run_id="r1")  # no raise
+
+    def test_raise_propagates_through_model_invoke(self):
+        # The whole point of raise_error=True: the guard's exception must
+        # escape the chat-model invocation, not be logged-and-swallowed.
+        from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+        model = GenericFakeChatModel(messages=iter(["never reached"]))
+        with pytest.raises(TaskAbandoned):
+            model.invoke([("human", "hi")], config={"callbacks": [AbandonmentGuard(lambda: True)]})
+
+    def test_live_task_invoke_untouched(self):
+        from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+        model = GenericFakeChatModel(messages=iter(["ok"]))
+        response = model.invoke(
+            [("human", "hi")], config={"callbacks": [AbandonmentGuard(lambda: False)]}
+        )
+        assert response.content == "ok"
+
+
+@pytest.mark.unit
+class TestAbandonedWorkerUnwinds:
+    def _backdate_events(self, db, task_id, age):
+        with db._lock:
+            db._conn.execute(
+                "UPDATE task_events SET ts=? WHERE task_id=?",
+                (time.time() - age, task_id),
+            )
+            db._conn.commit()
+
+    def test_runner_receives_abandonment_predicate(self, db):
+        release = threading.Event()
+        captured = {}
+
+        class ParkedRunner(_LateRunner):
+            def run(self, task, emit, db, is_abandoned=None):
+                emit("llm_start", {"node": "Market Analyst"})
+                captured["before"] = bool(is_abandoned and is_abandoned())
+                release.wait(timeout=10)
+                captured["after"] = bool(is_abandoned and is_abandoned())
+                return {"rating": "", "summary": "", "report_dir": ""}
+
+        task_id = _running_task(db)
+        q = TaskQueue(db, workers=0, max_idle=2400, runner_cls=ParkedRunner)
+        t = threading.Thread(target=q._execute, args=(db.get_task(task_id),), daemon=True)
+        t.start()
+        deadline = time.time() + 5
+        while len(db.events_since(task_id, 0)) < 2 and time.time() < deadline:
+            time.sleep(0.02)
+        self._backdate_events(db, task_id, 3000)
+        assert q._watchdog_sweep() == [task_id]
+        release.set()
+        t.join(timeout=5)
+        assert captured == {"before": False, "after": True}
+
+    def test_worker_unwinds_after_watchdog_failure(self, db):
+        release = threading.Event()
+        state = {"aborted": False, "completed": False}
+
+        class ParkedRunner(_LateRunner):
+            def run(self, task, emit, db, is_abandoned=None):
+                emit("llm_start", {"node": "Market Analyst"})
+                release.wait(timeout=10)
+                if is_abandoned is not None and is_abandoned():
+                    state["aborted"] = True
+                    raise TaskAbandoned("worker aborted")
+                state["completed"] = True
+                return {"rating": "BUY", "summary": "late", "report_dir": ""}
+
+        task_id = _running_task(db)
+        q = TaskQueue(db, workers=0, max_idle=2400, runner_cls=ParkedRunner)
+        t = threading.Thread(target=q._execute, args=(db.get_task(task_id),), daemon=True)
+        t.start()
+        deadline = time.time() + 5
+        while len(db.events_since(task_id, 0)) < 2 and time.time() < deadline:
+            time.sleep(0.02)  # status running + llm_start emitted
+        self._backdate_events(db, task_id, 3000)
+        assert q._watchdog_sweep() == [task_id]
+        release.set()
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert state["aborted"] and not state["completed"]
+        row = db.get_task(task_id)
+        assert row["status"] == "failed"
+        assert "看门狗" in row["error"]
+        types = [e["type"] for e in db.events_since(task_id, 0)]
+        assert types == ["status", "llm_start", "status"]
+        assert db.events_since(task_id, 0)[-1]["payload"]["status"] == "failed"
+
+
+@pytest.mark.unit
+class TestStreamHeartbeat:
+    def _handler(self, events):
+        return AgentStreamHandler(lambda kind, payload: events.append((kind, payload)))
+
+    def test_heartbeat_emitted_throttled_and_attributed(self, monkeypatch):
+        events = []
+        h = self._handler(events)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr("server.agent_stream.time.monotonic", lambda: clock["t"])
+        h._remember("run-1", {"kind": "llm", "node": "News Analyst"})
+
+        h.on_llm_new_token("a", run_id="run-1")
+        assert events == [("llm_progress", {"node": "News Analyst"})]
+
+        h.on_llm_new_token("b", run_id="run-1")  # inside the quiet window
+        assert len(events) == 1
+
+        clock["t"] += 61.0
+        h.on_llm_new_token("c", run_id="run-1")
+        assert len(events) == 2
+
+    def test_heartbeat_without_attribution_has_no_node(self, monkeypatch):
+        events = []
+        h = self._handler(events)
+        monkeypatch.setattr("server.agent_stream.time.monotonic", lambda: 5.0)
+        h.on_llm_new_token("x", run_id="unknown-run")
+        assert events == [("llm_progress", {"node": None})]

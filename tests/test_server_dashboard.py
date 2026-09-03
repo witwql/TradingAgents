@@ -36,7 +36,7 @@ class FakeRunner:
         db.set_stages(task_id, [name for name, _ in stages])
         self._stage = None
 
-    def run(self, task, emit, db):
+    def run(self, task, emit, db, is_abandoned=None):
         ticker = task["ticker"]
         if ticker in self.fail_tickers:
             raise RuntimeError(f"boom for {ticker}")
@@ -504,7 +504,7 @@ class TestParallelWorkers:
             def __init__(self, settings):
                 super().__init__(settings)
 
-            def run(self, task, emit, db):
+            def run(self, task, emit, db, is_abandoned=None):
                 emit("node", {"node": "Trader", "stage": "trader"})
                 barrier.wait()
                 self.calls.append(("run", task["id"]))
@@ -581,7 +581,7 @@ class TestSSELivePath:
         started = threading.Event()
 
         class ParkedRunner(FakeRunner):
-            def run(self, task, emit, db):
+            def run(self, task, emit, db, is_abandoned=None):
                 emit("status", {"status": "running", "ticker": task["ticker"]})
                 started.set()
                 release.wait(timeout=30)
