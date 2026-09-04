@@ -33,6 +33,14 @@ class Propagator:
         """
         return {
             "messages": [("human", company_name)],
+            # Each analyst branch gets the same company prompt on its private
+            # channel; the shared `messages` keeps its original role for the
+            # researcher/risk teams downstream.
+            "messages_market": [("human", company_name)],
+            "messages_social": [("human", company_name)],
+            "messages_news": [("human", company_name)],
+            "messages_fundamentals": [("human", company_name)],
+            "messages_macro": [("human", company_name)],
             "company_of_interest": company_name,
             "asset_type": asset_type,
             "instrument_context": instrument_context,

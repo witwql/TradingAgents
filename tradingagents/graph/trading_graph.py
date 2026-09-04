@@ -28,6 +28,7 @@ from tradingagents.agents.utils.agent_utils import (
     resolve_instrument_identity,
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.agents.utils.tool_availability import available_tools
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.global_macro import (
     get_crude_oil_price,
@@ -253,14 +254,19 @@ class TradingAgentsGraph:
                 ]
             ),
             "news": ToolNode(
-                [
-                    # News and insider information
-                    get_news,
-                    get_global_news,
-                    get_insider_transactions,
-                    get_macro_indicators,
-                    get_prediction_markets,
-                ]
+                # Gated so an unconfigured vendor (no FRED_API_KEY, polymarket
+                # unreachable) never gets a doomed tool round-trip; must stay
+                # in lockstep with the news analyst's bound tool list.
+                available_tools(
+                    [
+                        # News and insider information
+                        get_news,
+                        get_global_news,
+                        get_insider_transactions,
+                        get_macro_indicators,
+                        get_prediction_markets,
+                    ]
+                )
             ),
             "fundamentals": ToolNode(
                 [
@@ -408,11 +414,18 @@ class TradingAgentsGraph:
         Keyed into the checkpoint thread ID so a resume under a different analyst
         selection, debate/risk depth, or asset mode starts fresh instead of
         silently continuing the previous graph (#1089).
+
+        ``topology`` bumps when the graph shape changes in a way config keys
+        alone can't express (v2: analysts run as parallel branches). Looked
+        up with ``.get`` so a bare caller-supplied config dict doesn't
+        KeyError.
         """
         return "|".join([
+            "topology=2",
             "analysts=" + ",".join(self.selected_analysts),
-            f"debate={self.config['max_debate_rounds']}",
-            f"risk={self.config['max_risk_discuss_rounds']}",
+            f"debate={self.config.get('max_debate_rounds', 1)}",
+            f"risk={self.config.get('max_risk_discuss_rounds', 1)}",
+            f"rounds={self.config.get('analyst_max_tool_rounds', 0)}",
             f"asset={asset_type}",
         ])
 

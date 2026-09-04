@@ -21,6 +21,8 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
     "TRADINGAGENTS_LLM_TIMEOUT":          "llm_timeout",
     "TRADINGAGENTS_LLM_STREAMING":        "llm_streaming",
+    "TRADINGAGENTS_DISABLED_TOOLS":       "disabled_tools",
+    "TRADINGAGENTS_ANALYST_MAX_TOOL_ROUNDS": "analyst_max_tool_rounds",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
     # default). Settable here for non-interactive runs; the CLI also offers an
     # interactive choice, which is skipped when the matching var is set.
@@ -113,9 +115,11 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # client. Without it a wedged provider connection (request accepted,
     # response never sent) blocks the calling node forever: langgraph's node
     # retry only fires on exceptions, and with no timeout none ever comes.
-    # 300s ≈ 3.5× the slowest observed glm-5.3-flash analysis call (~84s at
-    # 10k-token context); 0/None disables the cap.
-    "llm_timeout": 300,
+    # With llm_streaming on (the default) this is a per-chunk idle timeout:
+    # observed legitimate chunk gaps are ≤1.4s, so 180s leaves >100× headroom
+    # while cutting wedge-recovery from 5min to 3min per attempt. 0/None
+    # disables the cap.
+    "llm_timeout": 180,
     # Stream LLM calls by default on the OpenAI-compatible family (GLM,
     # DeepSeek, Qwen, ...). Thinking models legitimately generate for 5-8 min;
     # non-streaming requests hold one silent connection the whole time and
@@ -135,6 +139,22 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
     "max_recur_limit": 100,
+    # Cap on tool-call rounds per analyst node (see
+    # tradingagents/agents/utils/tool_availability.py). The analyst makes at
+    # most this many LLM calls that carry tool_calls; the next call is made
+    # without bound tools so the model must emit its final report. Bounding
+    # what was previously limited only by recursion_limit=100 keeps a
+    # data-thirsty analyst (observed: get_indicators ×8) from stretching the
+    # analyst phase into tens of minutes. 0 disables the cap.
+    "analyst_max_tool_rounds": 3,
+    # Comma-separated tool names to unbind at graph-build time (e.g.
+    # "get_prediction_markets,get_macro_indicators"). Gating at bind time —
+    # instead of relying on the vendor layer to fail at call time — removes
+    # the deterministic failure mode where an unconfigured vendor (no
+    # FRED_API_KEY, polymarket host unreachable) burns a tool round-trip plus
+    # an LLM digestion round per call. The analyst prompt is segmented so it
+    # never advertises a bound tool.
+    "disabled_tools": "",
     # News / data fetching parameters
     # Increase for longer lookback strategies or to broaden macro coverage;
     # decrease to reduce token usage in agent prompts.

@@ -68,6 +68,12 @@ ANALYST_STAGE_KEY = {"market": "market", "social": "sentiment",
 
 ALL_ANALYST_KEYS = ("market", "social", "news", "fundamentals", "macro")
 
+# Stage ids of the analyst team. With the parallel graph topology these run
+# concurrently, so their stage rows are tracked individually (started when
+# the branch's first node completes, done when its "Msg Clear X" completes)
+# instead of through the single-slot serial rule.
+ANALYST_STAGES = frozenset({"market", "sentiment", "news", "fundamentals", "macro"})
+
 
 class TaskAbandoned(RuntimeError):
     """Raised to unwind a run whose task the watchdog already failed.
@@ -99,6 +105,9 @@ class AnalysisRunner:
 
     def __init__(self, settings: dict[str, str]):
         self.settings = settings
+        self._current_stage = None
+        self._started_stages = set()
+        self._done_stages = set()
 
     def _build_config(self, task: dict) -> dict:
         config = DEFAULT_CONFIG.copy()
@@ -132,6 +141,11 @@ class AnalysisRunner:
                 "macro_data": "fred",
                 "prediction_markets": "polymarket",
             }
+            # A-share reports don't use Polymarket odds, and the host has been
+            # unreachable from this deployment — each bound call burns a ~30s
+            # timeout plus an LLM digestion round. Unbind it outright; non-A-
+            # share runs keep it (the polymarket circuit breaker backstops).
+            config["disabled_tools"] = "get_prediction_markets"
         return config
 
     def run(self, task: dict, emit, db, is_abandoned=None) -> dict:
@@ -148,7 +162,7 @@ class AnalysisRunner:
         def progress(event: dict):
             node = event.get("node", "")
             stage = NODE_TO_STAGE.get(node)
-            self._advance_stage(db, task["id"], emit, stage)
+            self._advance_stage(db, task["id"], emit, stage, node)
             emit(
                 "node",
                 {"node": node, "stage": stage},
@@ -204,26 +218,65 @@ class AnalysisRunner:
             "report_dir": str(report_dir) if report_dir else "",
         }
 
-    def _advance_stage(self, db, task_id, emit, stage: str | None):
-        if not stage or stage == getattr(self, "_current_stage", None):
+    def _advance_stage(self, db, task_id, emit, stage: str | None, node: str = ""):
+        if not stage:
             return
+        if stage in ANALYST_STAGES:
+            self._advance_analyst_stage(db, task_id, emit, stage, node)
+        else:
+            self._advance_serial_stage(db, task_id, emit, stage)
+
+    def _advance_analyst_stage(self, db, task_id, emit, stage: str, node: str):
+        started = self._started_stages
+        done = self._done_stages
+        if node.startswith("Msg Clear"):
+            if stage in done:
+                return
+            done.add(stage)
+            db.update_stage(task_id, stage, "done")
+            emit("stage", {"completed": stage})
+        elif stage not in started:
+            started.add(stage)
+            db.update_stage(task_id, stage, "running")
+            emit("stage", {"started": stage})
+            # The task list shows current_stage as a progress label; with
+            # concurrent analyst starts the last writer wins, which is fine
+            # for display purposes.
+            db.update_task(task_id, current_stage=stage)
+
+    def _advance_serial_stage(self, db, task_id, emit, stage: str):
         prev = getattr(self, "_current_stage", None)
+        if stage == prev:
+            return
         if prev:
             db.update_stage(task_id, prev, "done")
+            emit("stage", {"completed": prev})
         db.update_stage(task_id, stage, "running")
+        emit("stage", {"started": stage})
         self._current_stage = stage
-        emit("stage", {"completed": prev, "started": stage})
         db.update_task(task_id, current_stage=stage)
+        # The tail phase starts only after the analyst fan-in barrier, so any
+        # analyst stage still tracked as running is finished by definition;
+        # this is belt-and-braces against event-order surprises.
+        for leftover in self._started_stages - self._done_stages:
+            self._done_stages.add(leftover)
+            db.update_stage(task_id, leftover, "done")
+            emit("stage", {"completed": leftover})
 
     def reset(self, task_id: str, db, stages: list[tuple[str, str]]):
         db.set_stages(task_id, [name for name, _ in stages])
         self._current_stage = None
+        self._started_stages = set()
+        self._done_stages = set()
 
     def finish_stages(self, task_id: str, db):
         prev = getattr(self, "_current_stage", None)
         if prev:
             db.update_stage(task_id, prev, "done")
         self._current_stage = None
+        for leftover in self._started_stages - self._done_stages:
+            self._done_stages.add(leftover)
+            db.update_stage(task_id, leftover, "done")
 
 
 def _looks_like_ashare(ticker: str) -> bool:

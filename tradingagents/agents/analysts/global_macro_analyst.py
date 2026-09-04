@@ -19,6 +19,10 @@ from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
 )
+from tradingagents.agents.utils.tool_availability import (
+    analyst_tool_budget,
+    tool_rounds_used,
+)
 from tradingagents.dataflows.global_macro import (
     get_crude_oil_price,
     get_factor_exposure,
@@ -80,13 +84,19 @@ def create_global_macro_analyst(llm):
             current_date=state.get("trade_date", ""),
             language_instruction=get_language_instruction(),
         )
-        chain = prompt | llm_with_tools
-        response = chain.invoke({"messages": state["messages"]})
+        # Tool-loop cap enforced at node entry (see market_analyst): past the
+        # budget the call goes out WITHOUT bound tools so the model must emit
+        # its final report and the router reaches the clear node on its own.
+        model = llm_with_tools
+        cap = analyst_tool_budget()
+        if cap and tool_rounds_used(state["messages_macro"]) >= cap:
+            model = llm
+        response = (prompt | model).invoke({"messages": state["messages_macro"]})
 
         report = ""
         if not response.tool_calls:
             report = response.content
 
-        return {"messages": [response], "macro_report": report}
+        return {"messages_macro": [response], "macro_report": report}
 
     return global_macro_node

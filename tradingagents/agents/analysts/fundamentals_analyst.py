@@ -8,19 +8,24 @@ from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
 )
+from tradingagents.agents.utils.tool_availability import (
+    analyst_tool_budget,
+    tool_rounds_used,
+)
 
 
 def create_fundamentals_analyst(llm):
+    tools = [
+        get_fundamentals,
+        get_balance_sheet,
+        get_cashflow,
+        get_income_statement,
+    ]
+    llm_with_tools = llm.bind_tools(tools)
+
     def fundamentals_analyst_node(state):
         current_date = state["trade_date"]
         instrument_context = get_instrument_context_from_state(state)
-
-        tools = [
-            get_fundamentals,
-            get_balance_sheet,
-            get_cashflow,
-            get_income_statement,
-        ]
 
         system_message = (
             "You are a researcher tasked with analyzing fundamental information over the past week about a company. Please write a comprehensive report of the company's fundamental information such as financial documents, company profile, basic company financials, and company financial history to gain a full view of the company's fundamental information to inform traders. Make sure to include as much detail as possible. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."
@@ -52,9 +57,17 @@ def create_fundamentals_analyst(llm):
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
 
-        chain = prompt | llm.bind_tools(tools)
+        # Tool-loop cap enforced at node entry (see market_analyst): past the
+        # budget the call goes out WITHOUT bound tools so the model must emit
+        # its final report and the router reaches the clear node on its own.
+        cap = analyst_tool_budget()
+        model = llm_with_tools
+        if cap and tool_rounds_used(state["messages_fundamentals"]) >= cap:
+            model = llm
 
-        result = chain.invoke(state["messages"])
+        chain = prompt | model
+
+        result = chain.invoke(state["messages_fundamentals"])
 
         report = ""
 
@@ -62,7 +75,7 @@ def create_fundamentals_analyst(llm):
             report = result.content
 
         return {
-            "messages": [result],
+            "messages_fundamentals": [result],
             "fundamentals_report": report,
         }
 

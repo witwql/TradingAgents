@@ -343,7 +343,7 @@ def _make_sentiment_state():
         "company_of_interest": "NVDA",
         "trade_date": "2026-01-15",
         "asset_type": "stock",
-        "messages": [],
+        "messages_social": [],
     }
 
 
@@ -383,8 +383,8 @@ class TestSentimentAnalystAgent:
         captured = {}
         analyst = create_sentiment_analyst(_structured_sentiment_llm(captured))
         result = analyst(_make_sentiment_state())
-        assert len(result["messages"]) == 1
-        assert result["sentiment_report"] == result["messages"][0].content
+        assert len(result["messages_social"]) == 1
+        assert result["sentiment_report"] == result["messages_social"][0].content
 
     def test_prompt_contains_ticker(self):
         captured = {}

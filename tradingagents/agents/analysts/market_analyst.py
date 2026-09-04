@@ -7,19 +7,23 @@ from tradingagents.agents.utils.agent_utils import (
     get_stock_data,
     get_verified_market_snapshot,
 )
+from tradingagents.agents.utils.tool_availability import (
+    analyst_tool_budget,
+    tool_rounds_used,
+)
 
 
 def create_market_analyst(llm):
+    tools = [
+        get_stock_data,
+        get_indicators,
+        get_verified_market_snapshot,
+    ]
+    llm_with_tools = llm.bind_tools(tools)
 
     def market_analyst_node(state):
         current_date = state["trade_date"]
         instrument_context = get_instrument_context_from_state(state)
-
-        tools = [
-            get_stock_data,
-            get_indicators,
-            get_verified_market_snapshot,
-        ]
 
         system_message = (
             """You are a trading assistant tasked with analyzing financial markets. Your role is to select the **most relevant indicators** for a given market condition or trading strategy from the following list. The goal is to choose up to **8 indicators** that provide complementary insights without redundancy. Categories and each category's indicators are:
@@ -78,9 +82,18 @@ Write a very detailed and nuanced report of the trends you observe. Provide spec
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
 
-        chain = prompt | llm.bind_tools(tools)
+        # Tool-loop cap enforced at node entry, not in the router: the report
+        # is only written on a no-tool_calls response, so past the budget we
+        # call WITHOUT bound tools — the model must emit its final report and
+        # the router then routes to the clear node on its own.
+        cap = analyst_tool_budget()
+        model = llm_with_tools
+        if cap and tool_rounds_used(state["messages_market"]) >= cap:
+            model = llm
 
-        result = chain.invoke(state["messages"])
+        chain = prompt | model
+
+        result = chain.invoke(state["messages_market"])
 
         report = ""
 
@@ -88,7 +101,7 @@ Write a very detailed and nuanced report of the trends you observe. Provide spec
             report = result.content
 
         return {
-            "messages": [result],
+            "messages_market": [result],
             "market_report": report,
         }
 

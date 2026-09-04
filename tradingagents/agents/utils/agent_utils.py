@@ -202,9 +202,9 @@ def get_instrument_context_from_state(state: Mapping[str, Any]) -> str:
     )
 
 
-def create_msg_delete():
+def create_msg_delete(channel: str = "messages"):
     def delete_messages(state):
-        """Clear messages and add a context-anchored placeholder.
+        """Clear ``channel`` and add a context-anchored placeholder.
 
         The placeholder must not be a bare ``"Continue"``: some
         OpenAI-compatible providers interpret that literally as the user task
@@ -212,8 +212,11 @@ def create_msg_delete():
         instrument (#888). Anchoring it to the resolved instrument context and
         date keeps the next analyst on-task even if the provider treats the
         placeholder as a standalone request.
+
+        Analysts each get their own private message channel so they can run
+        in parallel; each phase's clear node passes its channel name.
         """
-        messages = state["messages"]
+        messages = state[channel]
         removal_operations = [RemoveMessage(id=m.id) for m in messages]
 
         instrument_context = get_instrument_context_from_state(state)
@@ -224,7 +227,7 @@ def create_msg_delete():
                 f"{instrument_context} The analysis date is {trade_date}."
             )
         )
-        return {"messages": removal_operations + [placeholder]}
+        return {channel: removal_operations + [placeholder]}
 
     return delete_messages
 

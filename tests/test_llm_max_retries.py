@@ -123,9 +123,9 @@ def test_timeout_not_forwarded_when_disabled(disabled):
 @pytest.mark.unit
 def test_timeout_default_is_bounded(monkeypatch):
     dc = _reload_with_env(monkeypatch)
-    # 300s ≈ 3.5× 实测 glm-5.3-flash 分析级调用最慢耗时（~84s）；
-    # 与 llm_max_retries=1 组合，单次调用的最坏静默期 ≈ 10 分钟。
-    assert dc.DEFAULT_CONFIG["llm_timeout"] == 300
+    # 流式默认开启 → timeout 是分块空闲超时，实测合法分块间隔 ≤1.4s；
+    # 180s 余量 >100×，同时把卡死连接的单次恢复时间从 5min 压到 3min。
+    assert dc.DEFAULT_CONFIG["llm_timeout"] == 180
 
 
 @pytest.mark.unit

@@ -1,6 +1,7 @@
 from typing import Annotated
 
-from langgraph.graph import MessagesState
+from langchain_core.messages import AnyMessage
+from langgraph.graph import MessagesState, add_messages
 from typing_extensions import TypedDict
 
 
@@ -51,6 +52,16 @@ class AgentState(MessagesState):
     trade_date: Annotated[str, "What date we are trading at"]
 
     sender: Annotated[str, "Agent that sent this message"]
+
+    # Per-analyst private message channels. Analysts run in parallel
+    # fan-out/fan-in branches, so each gets its own transcript channel
+    # (seeded with the company prompt, appended by its LLM/tool turns, then
+    # cleared by its "Msg Clear X" node) instead of sharing `messages`.
+    messages_market: Annotated[list[AnyMessage], add_messages]
+    messages_social: Annotated[list[AnyMessage], add_messages]
+    messages_news: Annotated[list[AnyMessage], add_messages]
+    messages_fundamentals: Annotated[list[AnyMessage], add_messages]
+    messages_macro: Annotated[list[AnyMessage], add_messages]
 
     # research step
     market_report: Annotated[str, "Report from the Market Analyst"]

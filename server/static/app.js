@@ -288,7 +288,6 @@ function listenEvents(id) {
   if (state.drawerES) state.drawerES.close();
   const es = new EventSource(`/api/tasks/${id}/events`);
   state.drawerES = es;
-  let currentRunning = "";
   setDrawerHint("");
   es.onmessage = async (msg) => {
     if (msg.data === undefined) return; // heartbeat comment
@@ -298,11 +297,11 @@ function listenEvents(id) {
       appendAgentEvent(ev);
       return;
     }
-    if (ev.type === "node" && ev.stage) currentRunning = ev.stage;
     if (ev.type === "stage") {
-      currentRunning = ev.started || "";
+      // Analysts run as parallel branches, so stage rows are independent:
+      // marking one started must not clear other running rows.
       if (ev.completed) rows.forEach((r) => r.dataset.stage === ev.completed && (r.className = "stage-row done"));
-      rows.forEach((r) => r.classList.toggle("running", r.dataset.stage === currentRunning));
+      if (ev.started) rows.forEach((r) => r.dataset.stage === ev.started && (r.className = "stage-row running"));
     }
     if (ev.type === "status") {
       es.close();

@@ -13,7 +13,7 @@ class ConditionalLogic:
 
     def should_continue_market(self, state: AgentState):
         """Determine if market analysis should continue."""
-        messages = state["messages"]
+        messages = state["messages_market"]
         last_message = messages[-1]
         if last_message.tool_calls:
             return "tools_market"
@@ -27,7 +27,7 @@ class ConditionalLogic:
         back-compat); the returned ``clear_node`` label uses the v0.2.5
         rename so it matches the node registered by the execution plan.
         """
-        messages = state["messages"]
+        messages = state["messages_social"]
         last_message = messages[-1]
         if last_message.tool_calls:
             return "tools_social"
@@ -35,7 +35,7 @@ class ConditionalLogic:
 
     def should_continue_news(self, state: AgentState):
         """Determine if news analysis should continue."""
-        messages = state["messages"]
+        messages = state["messages_news"]
         last_message = messages[-1]
         if last_message.tool_calls:
             return "tools_news"
@@ -43,7 +43,7 @@ class ConditionalLogic:
 
     def should_continue_fundamentals(self, state: AgentState):
         """Determine if fundamentals analysis should continue."""
-        messages = state["messages"]
+        messages = state["messages_fundamentals"]
         last_message = messages[-1]
         if last_message.tool_calls:
             return "tools_fundamentals"
@@ -51,7 +51,7 @@ class ConditionalLogic:
 
     def should_continue_macro(self, state: AgentState):
         """Determine if global-macro analysis should continue."""
-        messages = state["messages"]
+        messages = state["messages_macro"]
         last_message = messages[-1]
         if last_message.tool_calls:
             return "tools_macro"
